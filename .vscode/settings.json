@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "**/Core/Src/main.c": "cpp",
+        "**/User/com_to_raspi.c": "cpp",
+        "*.hpp": "cpp"
+    },
+    "cmake.sourceDirectory": "C:/Users/Lenovo/Desktop/work/cskhyj/CSKHYJ/Drivers/CMSIS/DSP/Source/InterpolationFunctions"
+}
