@@ -1,8 +1,12 @@
 *
 !*/
-!*.c
-!*.cpp
-!*.h
-!*.hpp
+!Core/
+!Core/Inc/
+!Core/Inc/**
+!Core/Src/
+!Core/Src/**
+!User/
+!User/**
 !*.ioc
+!CSKHYJ.uvprojx
 !.gitignore
