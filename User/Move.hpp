@@ -13,15 +13,14 @@ extern "C" {
  * Responsibilities:
  *   - chassis translation
  *   - chassis in-place rotation
+ *   - non-blocking line trace scheduling
  *   - stop
  *   - USART1 community receive callback forwarding
  *   - TIM6 20ms chassis control callback
  *
- * It does NOT handle:
- *   - line tracing
- *   - arm/grab
- *   - building/lead-screw
- *   - servo actions
+ * LineTrace itself is implemented in LineTrace.c.
+ * Move_Process() is responsible for executing the non-blocking
+ * action requests returned by LineTrace_Process().
  */
 void Move_Init(void);
 void Move_Process(void);

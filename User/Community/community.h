@@ -15,38 +15,42 @@ extern "C" {
  *
  * 帧头：66 66
  *
- *
  * 0x02 底盘平移
  *      payload:
- *      angle_deg    uint16_t, little-endian
+ *      angle_deg    uint16_t, big-endian
+ *                   decoded = payload[0] * 256 + payload[1]
  *      distance_cm  uint8_t
  *
  * 0x03 底盘旋转
  *      payload:
- *      rotate_deg   int16_t, little-endian
+ *      encoded_angle uint16_t, big-endian
+ *      clockwise_deg = encoded_angle - 180
+ *
+ *      Move 内部使用“逆时针为正”，所以接收后会转换符号。
  *
  * 0x05 立即发起机械臂夹取
  *      无 payload
  *
- * 0x06 当前未使用（原巡线命令已移除）
- *
- *
  * 0x07 停止全部
  *      无 payload
  *
- *
- * 0x09 禁止 0x82 完成应答
+ * 0x08 立即发起搭建任务
  *      无 payload
- *
- * 0x0A 允许 0x82 完成应答
- *      无 payload
- *
- * 0x0B 立即发起搭建任务
- *      无 payload
- *      丝杆移动到搭建位置后自动返回初始位置
  *
  * 0x55 开环测试
  *      无 payload
+ *
+ * 0x06 巡线任务
+ *      payload:
+ *      line_trace_status uint8_t
+ *
+ *      目前支持：
+ *      0x00 = Initial_Status
+ *             路口序列 [0, 2, 0, 1, 3]
+ *             0 = 直行
+ *             1 = 左转
+ *             2 = 右转
+ *             3 = 终点
  */
 
 #define COMMUNITY_FRAME_HEAD_1              0x66U
@@ -55,12 +59,15 @@ extern "C" {
 #define COMMUNITY_CMD_CHASSIS_MOVE          0x02U
 #define COMMUNITY_CMD_CHASSIS_ROTATE        0x03U
 #define COMMUNITY_CMD_ARM_GRAB              0x05U
+#define COMMUNITY_CMD_LINE_TRACE            0x06U
 #define COMMUNITY_CMD_STOP_ALL              0x07U
-#define COMMUNITY_CMD_ENABLE_ACK            0x08U
-#define COMMUNITY_CMD_ARM_BUILD             0x0BU
+#define COMMUNITY_CMD_ARM_BUILD             0x08U
 #define COMMUNITY_CMD_OPENLOOP_TEST         0x55U
+
+
 #define COMMUNITY_TX_CHASSIS_ALL_DONE       0x82U
-#define COMMUNITY_TX_ARM_GRAB_DONE          0x85U
+#define COMMUNITY_TX_ARM_GRAB_DONE          0x83U
+#define COMMUNITY_TX_ARM_BUILD_DONE         0x85U
 
 #ifndef COMMUNITY_QUEUE_SIZE
 #define COMMUNITY_QUEUE_SIZE                16U
@@ -72,6 +79,7 @@ typedef enum
 
     COMMUNITY_MISSION_CHASSIS_MOVE,
     COMMUNITY_MISSION_CHASSIS_ROTATE,
+    COMMUNITY_MISSION_LINE_TRACE,
     COMMUNITY_MISSION_STOP_ALL,
     COMMUNITY_MISSION_OPENLOOP_TEST,
 
@@ -92,6 +100,7 @@ typedef struct
     {
         Community_MoveParsed_t move;
         int16_t rotate_deg;
+        uint8_t line_trace_status;
         uint8_t raw_u8;
     } parsed;
 
@@ -122,9 +131,6 @@ void Community_SendSimpleFrame(uint8_t cmd);
 void Community_SendFinish(void);
 void Community_SendArmFinish(void);
 void Community_SendDebugString(const char *str);
-
-void Community_SetAckEnable(uint8_t enable);
-uint8_t Community_GetAckEnable(void);
 
 #ifdef __cplusplus
 }

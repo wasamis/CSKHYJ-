@@ -51,16 +51,24 @@ static uint8_t s_queue_count = 0U;
  */
 
 static volatile uint8_t s_stop_request = 0U;
-static uint8_t s_ack_enable = 1U;
 
 /*
  * 机械臂命令不进入普通任务队列。
- * 这样 0x05 到达后，Move_Process() 下一次循环即可立即处理，
+ * 这样命令到达后，Move_Process() 下一次循环即可立即处理，
  * 不会排在已有底盘任务后面。
  */
 static volatile uint8_t s_arm_grab_request = 0U;
 static volatile uint8_t s_arm_build_request = 0U;
 
+/*
+ * ArmTask 现有流程复用 Community_SendFinish()：
+ *   - 搭建完成时应发送 0x85，而不是底盘完成 0x82；
+ *   - 夹取完成已经发送 0x83，随后一次通用完成调用应被忽略。
+ *
+ * 这里在 Community 内完成兼容，不改变 ArmTask 的现有接口。
+ */
+static uint8_t s_arm_build_active = 0U;
+static uint8_t s_suppress_next_general_finish = 0U;
 
 /*
  * ============================================================
@@ -69,9 +77,11 @@ static volatile uint8_t s_arm_build_request = 0U;
  */
 
 static uint8_t Community_GetPayloadLength(uint8_t cmd);
-static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t len);
-static int16_t Community_ReadInt16LE(const uint8_t *p);
-static uint16_t Community_ReadUInt16LE(const uint8_t *p);
+static void Community_ParseFrame(uint8_t cmd,
+                                 const uint8_t *payload,
+                                 uint8_t len);
+
+static uint16_t Community_ReadUInt16BE(const uint8_t *p);
 
 /*
  * ============================================================
@@ -89,10 +99,11 @@ void Community_Init(void)
     Community_ClearQueue();
 
     s_stop_request = 0U;
-    s_ack_enable = 1U;
 
     s_arm_grab_request = 0U;
     s_arm_build_request = 0U;
+    s_arm_build_active = 0U;
+    s_suppress_next_general_finish = 0U;
 
     Community_RestartReceive();
 }
@@ -103,7 +114,8 @@ void Community_RestartReceive(void)
 }
 
 /*
- * USART1 每收到 1 字节后，Move_UART_RxCpltCallback() 会调用 Receive_Analyse()。
+ * USART1 每收到 1 字节后，
+ * Move_UART_RxCpltCallback() 会调用 Receive_Analyse()。
  */
 void Receive_Analyse(void)
 {
@@ -121,6 +133,7 @@ void Community_RxByte(uint8_t data)
         {
             s_rx_state = COMMUNITY_RX_WAIT_HEAD2;
         }
+
         break;
     }
 
@@ -138,18 +151,25 @@ void Community_RxByte(uint8_t data)
         {
             s_rx_state = COMMUNITY_RX_WAIT_HEAD1;
         }
+
         break;
     }
 
     case COMMUNITY_RX_WAIT_CMD:
     {
         s_rx_cmd = data;
-        s_rx_payload_len = Community_GetPayloadLength(s_rx_cmd);
+        s_rx_payload_len =
+            Community_GetPayloadLength(s_rx_cmd);
+
         s_rx_payload_index = 0U;
 
         if (s_rx_payload_len == 0U)
         {
-            Community_ParseFrame(s_rx_cmd, s_rx_payload, 0U);
+            Community_ParseFrame(
+                s_rx_cmd,
+                s_rx_payload,
+                0U);
+
             s_rx_state = COMMUNITY_RX_WAIT_HEAD1;
         }
         else
@@ -173,7 +193,11 @@ void Community_RxByte(uint8_t data)
 
         if (s_rx_payload_index >= s_rx_payload_len)
         {
-            Community_ParseFrame(s_rx_cmd, s_rx_payload, s_rx_payload_len);
+            Community_ParseFrame(
+                s_rx_cmd,
+                s_rx_payload,
+                s_rx_payload_len);
+
             s_rx_state = COMMUNITY_RX_WAIT_HEAD1;
         }
 
@@ -193,7 +217,8 @@ uint8_t Mission_Queue(Community_Mission_t *mission)
     return Community_PopMission(mission);
 }
 
-uint8_t Community_PushMission(const Community_Mission_t *mission)
+uint8_t Community_PushMission(
+    const Community_Mission_t *mission)
 {
     if (mission == NULL)
     {
@@ -208,6 +233,7 @@ uint8_t Community_PushMission(const Community_Mission_t *mission)
     s_queue[s_queue_tail] = *mission;
 
     s_queue_tail++;
+
     if (s_queue_tail >= COMMUNITY_QUEUE_SIZE)
     {
         s_queue_tail = 0U;
@@ -218,7 +244,8 @@ uint8_t Community_PushMission(const Community_Mission_t *mission)
     return 1U;
 }
 
-uint8_t Community_PopMission(Community_Mission_t *mission)
+uint8_t Community_PopMission(
+    Community_Mission_t *mission)
 {
     if (mission == NULL)
     {
@@ -233,6 +260,7 @@ uint8_t Community_PopMission(Community_Mission_t *mission)
     *mission = s_queue[s_queue_head];
 
     s_queue_head++;
+
     if (s_queue_head >= COMMUNITY_QUEUE_SIZE)
     {
         s_queue_head = 0U;
@@ -284,9 +312,13 @@ uint8_t Community_TakeArmBuildRequest(void)
     request = s_arm_build_request;
     s_arm_build_request = 0U;
 
+    if (request != 0U)
+    {
+        s_arm_build_active = 1U;
+    }
+
     return request;
 }
-
 
 void Community_SendSimpleFrame(uint8_t cmd)
 {
@@ -296,49 +328,58 @@ void Community_SendSimpleFrame(uint8_t cmd)
     tx[1] = COMMUNITY_FRAME_HEAD_2;
     tx[2] = cmd;
 
-    HAL_UART_Transmit(&huart1, tx, sizeof(tx), 20U);
+    HAL_UART_Transmit(
+        &huart1,
+        tx,
+        sizeof(tx),
+        20U);
 }
 
 void Community_SendFinish(void)
 {
-    if (s_ack_enable == 0U)
+    if (s_suppress_next_general_finish != 0U)
     {
+        s_suppress_next_general_finish = 0U;
         return;
     }
 
-    Community_SendSimpleFrame(COMMUNITY_TX_CHASSIS_ALL_DONE);
+    if (s_arm_build_active != 0U)
+    {
+        s_arm_build_active = 0U;
+
+        Community_SendSimpleFrame(
+            COMMUNITY_TX_ARM_BUILD_DONE);
+
+        return;
+    }
+
+    Community_SendSimpleFrame(
+        COMMUNITY_TX_CHASSIS_ALL_DONE);
 }
 
 void Community_SendArmFinish(void)
 {
     /*
-     * 0x09/0x0A 只控制 0x82。
-     * 夹取专用完成帧 0x85 始终发送。
+     * 协议规定夹取完成帧为 0x83。
      */
-    Community_SendSimpleFrame(COMMUNITY_TX_ARM_GRAB_DONE);
+    Community_SendSimpleFrame(
+        COMMUNITY_TX_ARM_GRAB_DONE);
+
+    /*
+     * ArmTask 现有代码随后还会调用一次 Community_SendFinish()。
+     * 协议中夹取完成只需要 0x83，因此忽略紧随其后的通用完成。
+     */
+    s_suppress_next_general_finish = 1U;
 }
 
 void Community_SendDebugString(const char *str)
 {
-    if (str == NULL)
-    {
-        return;
-    }
-
-    HAL_UART_Transmit(&huart1,
-                      (uint8_t *)str,
-                      (uint16_t)strlen(str),
-                      100U);
-}
-
-void Community_SetAckEnable(uint8_t enable)
-{
-    s_ack_enable = enable ? 1U : 0U;
-}
-
-uint8_t Community_GetAckEnable(void)
-{
-    return s_ack_enable;
+    /*
+     * USART1 是 OpenMV 二进制协议链路。
+     * 原始 ASCII 会产生协议外数据，因此默认不在该串口输出调试文本。
+     * 保留空接口，避免影响 Move/ArmTask 的现有调用关系。
+     */
+    (void)str;
 }
 
 /*
@@ -351,20 +392,19 @@ static uint8_t Community_GetPayloadLength(uint8_t cmd)
 {
     switch (cmd)
     {
-
     case COMMUNITY_CMD_CHASSIS_MOVE:
         return 3U;
 
     case COMMUNITY_CMD_CHASSIS_ROTATE:
         return 2U;
 
+    case COMMUNITY_CMD_LINE_TRACE:
+        return 1U;
+
     case COMMUNITY_CMD_ARM_GRAB:
         return 0U;
 
     case COMMUNITY_CMD_STOP_ALL:
-        return 0U;
-
-    case COMMUNITY_CMD_ENABLE_ACK:
         return 0U;
 
     case COMMUNITY_CMD_ARM_BUILD:
@@ -378,7 +418,10 @@ static uint8_t Community_GetPayloadLength(uint8_t cmd)
     }
 }
 
-static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t len)
+static void Community_ParseFrame(
+    uint8_t cmd,
+    const uint8_t *payload,
+    uint8_t len)
 {
     Community_Mission_t mission;
 
@@ -386,7 +429,6 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
 
     switch (cmd)
     {
-
     case COMMUNITY_CMD_CHASSIS_MOVE:
     {
         if (len < 3U)
@@ -394,11 +436,17 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
             return;
         }
 
-        mission.type = COMMUNITY_MISSION_CHASSIS_MOVE;
-        mission.parsed.move.angle_deg = Community_ReadUInt16LE(&payload[0]);
-        mission.parsed.move.distance_cm = payload[2];
+        mission.type =
+            COMMUNITY_MISSION_CHASSIS_MOVE;
+
+        mission.parsed.move.angle_deg =
+            Community_ReadUInt16BE(&payload[0]);
+
+        mission.parsed.move.distance_cm =
+            payload[2];
 
         Community_PushMission(&mission);
+
         break;
     }
 
@@ -409,10 +457,47 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
             return;
         }
 
-        mission.type = COMMUNITY_MISSION_CHASSIS_ROTATE;
-        mission.parsed.rotate_deg = Community_ReadInt16LE(&payload[0]);
+        mission.type =
+            COMMUNITY_MISSION_CHASSIS_ROTATE;
+
+        /*
+         * 协议：
+         *   encoded = a * 256 + b
+         *   clockwise_deg = encoded - 180
+         *
+         * Move_StartRotate() / Chassis::Set_add_rad() 使用
+         * “逆时针为正”，所以这里转换为相反符号。
+         */
+        const int16_t clockwise_deg =
+            (int16_t)Community_ReadUInt16BE(&payload[0]) - 180;
+
+        mission.parsed.rotate_deg =
+            (int16_t)(-clockwise_deg);
 
         Community_PushMission(&mission);
+
+        break;
+    }
+
+    case COMMUNITY_CMD_LINE_TRACE:
+    {
+        if (len < 1U)
+        {
+            return;
+        }
+
+        /*
+         * 巡线任务和普通底盘任务一样进入现有环形队列。
+         * 真正巡线状态机在 Move_Process() 主循环中非阻塞运行。
+         */
+        mission.type =
+            COMMUNITY_MISSION_LINE_TRACE;
+
+        mission.parsed.line_trace_status =
+            payload[0];
+
+        Community_PushMission(&mission);
+
         break;
     }
 
@@ -420,20 +505,17 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
     {
         /*
          * 不入普通队列，直接置位高优先级请求。
-         * 真正的舵机动作放在主循环 Move_Process() 中执行，
-         * 避免在 USART1 接收中断里阻塞发送 USART2。
+         * 真正动作放在主循环中执行。
          */
         s_arm_grab_request = 1U;
+
         break;
     }
 
     case COMMUNITY_CMD_ARM_BUILD:
     {
-        /*
-         * 0x08 搭建任务同样采用直接请求标志。
-         * 真正的丝杆 STEP/DIR 动作放在主循环中非阻塞执行。
-         */
         s_arm_build_request = 1U;
+
         break;
     }
 
@@ -442,29 +524,30 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
         s_stop_request = 1U;
         s_arm_grab_request = 0U;
         s_arm_build_request = 0U;
+        s_arm_build_active = 0U;
+        s_suppress_next_general_finish = 0U;
 
         Community_ClearQueue();
 
         /*
          * 保留 STOP 任务兼容原有调度逻辑。
-         * Move_Process() 仍会优先处理 s_stop_request。
+         * Move_Process() 仍然优先处理 s_stop_request。
          */
-        mission.type = COMMUNITY_MISSION_STOP_ALL;
+        mission.type =
+            COMMUNITY_MISSION_STOP_ALL;
+
         Community_PushMission(&mission);
 
-        break;
-    }
-
-    case COMMUNITY_CMD_ENABLE_ACK:
-    {
-        Community_SetAckEnable(1U);
         break;
     }
 
     case COMMUNITY_CMD_OPENLOOP_TEST:
     {
-        mission.type = COMMUNITY_MISSION_OPENLOOP_TEST;
+        mission.type =
+            COMMUNITY_MISSION_OPENLOOP_TEST;
+
         Community_PushMission(&mission);
+
         break;
     }
 
@@ -475,21 +558,14 @@ static void Community_ParseFrame(uint8_t cmd, const uint8_t *payload, uint8_t le
     }
 }
 
-static int16_t Community_ReadInt16LE(const uint8_t *p)
+static uint16_t Community_ReadUInt16BE(
+    const uint8_t *p)
 {
     uint16_t value;
 
-    value = ((uint16_t)p[1] << 8) | ((uint16_t)p[0]);
-
-    return (int16_t)value;
-}
-
-static uint16_t Community_ReadUInt16LE(const uint8_t *p)
-{
-    uint16_t value;
-
-    value = ((uint16_t)p[1] << 8) | ((uint16_t)p[0]);
+    value =
+        ((uint16_t)p[0] << 8) |
+        ((uint16_t)p[1]);
 
     return value;
 }
-
