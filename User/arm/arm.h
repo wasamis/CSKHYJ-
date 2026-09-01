@@ -104,17 +104,19 @@ typedef enum
  * 丝杆搭建任务状态
  * ============================================================
  *
- * 0x0B 触发后：
- * 1. 从当前软件位置移动到 BUILD 位置；
- * 2. 到位后短暂停留；
- * 3. 自动返回 HOME 初始位置；
- * 4. 任务完成。
+ * 0x08 触发后：
+ * 1. 将开关舵机从初始 OPEN 位转到 CLOSE 位；
+ * 2. 等待舵机到位后，丝杆移动到 BUILD 位置；
+ * 3. 丝杆到位后将开关舵机重新打开；
+ * 4. 等待舵机到位后，丝杆自动返回 HOME 位置；
+ * 5. 任务完成。
  */
 typedef enum
 {
     ARM_BUILD_STATE_IDLE = 0,
+    ARM_BUILD_STATE_SWITCH_SERVO_CLOSING,
     ARM_BUILD_STATE_MOVE_TO_BUILD,
-    ARM_BUILD_STATE_HOLD,
+    ARM_BUILD_STATE_SWITCH_SERVO_OPENING,
     ARM_BUILD_STATE_RETURN_HOME
 
 } Arm_BuildState_t;

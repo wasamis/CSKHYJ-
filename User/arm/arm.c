@@ -15,6 +15,7 @@
  * Servo 3：小臂 Elbow     -> TIM2_CH3//usart
  * Servo 4：腕部 Wrist     -> TIM2_CH4//usart
  * Servo 5：夹爪 Gripper   -> TIM5_CH1
+ * 开关舵机 Switch Servo -> TIM12_CH1
  *
  * TIM3_CH2 / CH3 / CH4 不在本文件中启动或修改。
  *
@@ -105,7 +106,7 @@ static const uint16_t g_bus_servo_time_ms[ARM_SERVO_COUNT] = {
  * 单位：TIM10 输出的 STEP 脉冲数。
  */
 #define ARM_SCREW_HOME_POSITION_STEPS            0L
-#define ARM_SCREW_BUILD_POSITION_STEPS           100000L
+#define ARM_SCREW_BUILD_POSITION_STEPS           140000L
 
 /*
  * ============================================================
@@ -128,9 +129,21 @@ static const uint16_t g_bus_servo_time_ms[ARM_SERVO_COUNT] = {
 #define ARM_SCREW_TIM_COUNTER_TARGET_HZ           2000000U
 
 /*
- * 到达搭建位置后的停留时间。
+ * ============================================================
+ * 开关舵机（TIM12_CH1）
+ * ============================================================
+ *
+ * TIM12 配置为 1 count = 1 us，周期 20000 us（50 Hz）。
+ * 如果实机方向相反，交换下面两个位置宏即可。
  */
-#define ARM_SCREW_BUILD_HOLD_MS                  200U
+#define ARM_SWITCH_SERVO_CLOSED_US              1900U
+#define ARM_SWITCH_SERVO_OPEN_US                1620U
+
+/*s
+ * 普通 PWM 舵机没有到位反馈，用此时间估算动作完成。
+ * 若实机还未到位丝杆就回程，增大此值。
+ */
+#define ARM_SWITCH_SERVO_MOVE_TIME_MS            700U
 
 /*
  * ============================================================
@@ -373,7 +386,7 @@ static volatile uint8_t s_build_finished = 0U;
 static Arm_BuildState_t s_build_state =
     ARM_BUILD_STATE_IDLE;
 
-static uint32_t s_build_hold_start_tick = 0U;
+static uint32_t s_switch_servo_move_start_tick = 0U;
 
 static volatile Arm_ScrewMotion_t s_screw_motion;
 
@@ -438,6 +451,7 @@ static void Arm_ScrewSetTarget(int32_t target_steps);
 static uint8_t Arm_ScrewUpdateMotion(void);
 static void Arm_ScrewStopMotion(void);
 static void Arm_FinishBuildSequence(void);
+static void Arm_SwitchServoWriteUs(uint16_t pulse_us);
 
 /* 准备动作 */
 static void Arm_StartPrepareOpenGripper(void);
@@ -483,6 +497,17 @@ void Arm_Init(void)
     HAL_TIM_PWM_Stop_IT(&htim10, TIM_CHANNEL_1);
 
     if (Arm_ScrewConfigureTim10(ARM_SCREW_STEP_FREQUENCY_HZ) == 0U)
+    {
+        Error_Handler();
+    }
+
+    /*
+     * TIM12_CH1 是开关舵机。先写打开位比较值，再启动 PWM，
+     * 避免刚启动时输出 0 us 的无效脉宽。
+     */
+    Arm_SwitchServoWriteUs(ARM_SWITCH_SERVO_OPEN_US);
+
+    if (HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1) != HAL_OK)
     {
         Error_Handler();
     }
@@ -576,7 +601,7 @@ void Arm_Init(void)
     s_build_busy = 0U;
     s_build_finished = 0U;
     s_build_state = ARM_BUILD_STATE_IDLE;
-    s_build_hold_start_tick = 0U;
+    s_switch_servo_move_start_tick = 0U;
 
     s_screw_motion.current_position_steps = ARM_SCREW_HOME_POSITION_STEPS;
     s_screw_motion.target_position_steps = ARM_SCREW_HOME_POSITION_STEPS;
@@ -627,11 +652,13 @@ uint8_t Arm_StartBuild(void)
     s_build_finished = 0U;
     s_build_busy = 1U;
 
-    Arm_ScrewSetTarget(
-        ARM_SCREW_BUILD_POSITION_STEPS);
+    Arm_SwitchServoWriteUs(
+        ARM_SWITCH_SERVO_CLOSED_US);
+
+    s_switch_servo_move_start_tick = HAL_GetTick();
 
     s_build_state =
-        ARM_BUILD_STATE_MOVE_TO_BUILD;
+        ARM_BUILD_STATE_SWITCH_SERVO_CLOSING;
 
     return 1U;
 }
@@ -662,26 +689,45 @@ void Arm_Process(void)
     {
         switch (s_build_state)
         {
-        case ARM_BUILD_STATE_MOVE_TO_BUILD:
+        case ARM_BUILD_STATE_SWITCH_SERVO_CLOSING:
         {
-            if (Arm_ScrewUpdateMotion() != 0U)
+            if ((uint32_t)(
+                    HAL_GetTick() -
+                    s_switch_servo_move_start_tick) >=
+                ARM_SWITCH_SERVO_MOVE_TIME_MS)
             {
-                s_build_hold_start_tick =
-                    HAL_GetTick();
+                Arm_ScrewSetTarget(
+                    ARM_SCREW_BUILD_POSITION_STEPS);
 
                 s_build_state =
-                    ARM_BUILD_STATE_HOLD;
+                    ARM_BUILD_STATE_MOVE_TO_BUILD;
             }
 
             break;
         }
 
-        case ARM_BUILD_STATE_HOLD:
+        case ARM_BUILD_STATE_MOVE_TO_BUILD:
+        {
+            if (Arm_ScrewUpdateMotion() != 0U)
+            {
+                Arm_SwitchServoWriteUs(
+                    ARM_SWITCH_SERVO_OPEN_US);
+
+                s_switch_servo_move_start_tick = HAL_GetTick();
+
+                s_build_state =
+                    ARM_BUILD_STATE_SWITCH_SERVO_OPENING;
+            }
+
+            break;
+        }
+
+        case ARM_BUILD_STATE_SWITCH_SERVO_OPENING:
         {
             if ((uint32_t)(
                     HAL_GetTick() -
-                    s_build_hold_start_tick) >=
-                ARM_SCREW_BUILD_HOLD_MS)
+                    s_switch_servo_move_start_tick) >=
+                ARM_SWITCH_SERVO_MOVE_TIME_MS)
             {
                 Arm_ScrewSetTarget(
                     ARM_SCREW_HOME_POSITION_STEPS);
@@ -1510,6 +1556,19 @@ static void Arm_FinishBuildSequence(void)
 
     s_build_state =
         ARM_BUILD_STATE_IDLE;
+}
+
+/*
+ * TIM12 已由 CubeMX 配置为 1 us/count，因此 CCR1 值就是脉宽 us。
+ */
+static void Arm_SwitchServoWriteUs(uint16_t pulse_us)
+{
+    pulse_us = Arm_ClampPulseUs(pulse_us);
+
+    __HAL_TIM_SET_COMPARE(
+        &htim12,
+        TIM_CHANNEL_1,
+        pulse_us);
 }
 
 /*
@@ -2579,4 +2638,3 @@ void Arm_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
         Arm_ScrewStopMotion();
     }
 }
-
