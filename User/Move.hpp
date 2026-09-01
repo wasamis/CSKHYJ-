@@ -18,7 +18,7 @@ extern "C" {
  *   - USART1 community receive callback forwarding
  *   - TIM6 20ms chassis control callback
  *
- * LineTrace itself is implemented in LineTrace.c.
+ * The 0x00 position sequence is implemented in LineTrace.c.
  * Move_Process() is responsible for executing the non-blocking
  * action requests returned by LineTrace_Process().
  */

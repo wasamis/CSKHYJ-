@@ -27,7 +27,7 @@
  *       or
  *   LineTrace_Process()
  *       ->
- *   non-blocking line-trace action request
+ *   non-blocking 0x00 position-sequence request
  *       ->
  *   Class_Chassis
  *
@@ -50,29 +50,26 @@
 #define MOVE_PI                         3.14159265358979323846f
 #endif
 
-/*
- * Outer angle loop output is wheel target speed, rad/s.
- */
-#define MOVE_WHEEL_OMEGA_LIMIT          8.0f
+/* 角度环实际允许的最大轮速。 */
+#define MOVE_ANGLE_WHEEL_OMEGA_LIMIT_RAD_S       6.0f
 
 /*
- * Movement is considered complete only when all four wheels are:
+ * 前进 2.24 m 时车体横向偏移 0.03 m：
  *
- *   1. close enough to their final angle target
- *   2. moving slowly enough
+ * left_trim / ahead = 0.03 / 2.24 = 0.013
  *
- * and remain so for several consecutive TIM6 callbacks.
+ * 实车测试确认正值会向右补偿，因此反转为负值。
  */
+#define MOVE_FORWARD_LEFT_TRIM_RATIO            0.013f
+
 /*
+ * Movement is complete when all four wheel-angle errors are small
+ * enough for several consecutive TIM6 callbacks.
+ *
  * 0.12rad wheel angle is about 6mm linear travel with the current
  * 50mm wheel radius, and below 1 degree chassis yaw for a 90deg turn.
- *
- * The previous 0.05rad window made the angle loop enter a very-low
- * output region where static friction could delay completion for
- * several seconds even though the chassis had visibly stopped.
  */
 #define MOVE_FINISH_ANGLE_TOL_RAD        0.12f
-#define MOVE_FINISH_OMEGA_TOL_RAD_S      0.80f
 #define MOVE_FINISH_STABLE_COUNT         3U
 
 /*
@@ -128,22 +125,18 @@ static void Move_StartMission(
 
 static void Move_StartTranslate(
     uint16_t angle_deg,
-    uint8_t distance_cm);
+    uint16_t distance_cm);
 
 static void Move_StartRotate(
     int16_t rotate_deg);
 
 static void Move_StopChassis(void);
 
-static void Move_SetLineTraceVelocity(
-    float forward_mps,
-    float right_mps,
-    float omega_rad_s);
-
 static void Move_ProcessLineTrace(
     uint8_t movement_finished_event);
 
-static void Move_SetAngleSpeedLimit(void);
+static void Move_SetAngleSpeedLimit(
+    float wheel_omega_limit_rad_s);
 
 static uint8_t Move_IsTargetReached(void);
 
@@ -177,17 +170,7 @@ extern "C" void Move_Init(void)
      */
     Community_Init();
 
-    /*
-     * LineTrace owns:
-     *   - I2C line-sensor sampling
-     *   - Initial_Status route state machine
-     *
-     * PB6/PB7 should already be configured by CubeMX as:
-     *   PB6 -> I2C1_SCL
-     *   PB7 -> I2C1_SDA
-     *
-     * and MX_I2C1_Init() should run before Move_Init().
-     */
+    /* LineTrace 当前是 0x00 路线的纯位置环状态机。 */
     LineTrace_Init();
 
     s_move_active = 0U;
@@ -249,8 +232,8 @@ extern "C" void Move_Process(void)
     /*
      * One finite movement has just completed.
      *
-     * The event is passed to LineTrace_Process() when line trace
-     * is currently waiting for its 20cm advance or ±90° turn.
+     * The event is passed to LineTrace_Process() when the 0x00
+     * position-sequence state machine is waiting for one step.
      */
     if (s_task_finished_pending != 0U)
     {
@@ -263,11 +246,10 @@ extern "C" void Move_Process(void)
 
     /*
      * ========================================================
-     * Active line-trace mission
+     * Active 0x00 position-sequence mission
      * ========================================================
      *
-     * A line-trace mission owns the chassis until it reaches
-     * its configured terminal route action.
+     * The sequence owns the chassis until all five steps finish.
      *
      * Later missions remain in the Community FIFO.
      */
@@ -572,7 +554,7 @@ static void Move_StartMission(
 
 static void Move_StartTranslate(
     uint16_t angle_deg,
-    uint8_t distance_cm)
+    uint16_t distance_cm)
 {
     if (distance_cm == 0U)
     {
@@ -613,9 +595,12 @@ static void Move_StartTranslate(
 
     const float left_rad =
         sinf(angle_rad) *
-        wheel_rad;
+        wheel_rad +
+        ahead_rad *
+        MOVE_FORWARD_LEFT_TRIM_RATIO;
 
-    Move_SetAngleSpeedLimit();
+    Move_SetAngleSpeedLimit(
+        MOVE_ANGLE_WHEEL_OMEGA_LIMIT_RAD_S);
 
     Move_Chassis.Set_Control_Method(
         Control_Method_ANGLE);
@@ -674,7 +659,8 @@ static void Move_StartRotate(
         chassis_rotate_rad /
         WHEEL_RADIUS;
 
-    Move_SetAngleSpeedLimit();
+    Move_SetAngleSpeedLimit(
+        MOVE_ANGLE_WHEEL_OMEGA_LIMIT_RAD_S);
 
     Move_Chassis.Set_Control_Method(
         Control_Method_ANGLE);
@@ -711,23 +697,6 @@ static void Move_ProcessLineTrace(
 
     switch (command.type)
     {
-    case LINETRACE_COMMAND_SET_VELOCITY:
-    {
-        /*
-         * 只有当前没有 20cm / 90deg 有限动作时，
-         * 才允许连续巡线速度覆盖底盘目标。
-         */
-        if (s_move_active == 0U)
-        {
-            Move_SetLineTraceVelocity(
-                command.forward_mps,
-                command.right_mps,
-                command.omega_rad_s);
-        }
-
-        break;
-    }
-
     case LINETRACE_COMMAND_MOVE_FORWARD_CM:
     {
         if (s_move_active == 0U)
@@ -753,11 +722,7 @@ static void Move_ProcessLineTrace(
 
     case LINETRACE_COMMAND_STOP:
     {
-        /*
-         * 巡线 I2C 失败 / 丢线过久 / 到达终点都会走这里。
-         *
-         * 状态机是否结束由 LineTrace 自己决定。
-         */
+        /* 0x00 位置序列全部完成。 */
         if (s_move_active == 0U)
         {
             Move_StopChassis();
@@ -772,30 +737,6 @@ static void Move_ProcessLineTrace(
         break;
     }
     }
-}
-
-static void Move_SetLineTraceVelocity(
-    float forward_mps,
-    float right_mps,
-    float omega_rad_s)
-{
-    SpeedTypeDef velocity;
-
-    velocity.X = right_mps;
-    velocity.Y = forward_mps;
-    velocity.Omega = omega_rad_s;
-
-    /*
-     * 连续巡线使用速度闭环。
-     *
-     * Set_Control_Method(OMEGA) 会退出 ANGLE 模式；
-     * TIM6 继续每 20ms 完成一次速度 PID + PWM 更新。
-     */
-    Move_Chassis.Set_Control_Method(
-        Control_Method_OMEGA);
-
-    Move_Chassis.Set_Velocity(
-        velocity);
 }
 
 /*
@@ -840,7 +781,8 @@ static void Move_StopChassis(void)
     }
 }
 
-static void Move_SetAngleSpeedLimit(void)
+static void Move_SetAngleSpeedLimit(
+    float wheel_omega_limit_rad_s)
 {
     for (int i = 0; i < 4; i++)
     {
@@ -849,7 +791,7 @@ static void Move_SetAngleSpeedLimit(void)
          */
         Move_Chassis.Motor[i].
             Angle_PID.Set_Out_Max(
-                MOVE_WHEEL_OMEGA_LIMIT);
+                wheel_omega_limit_rad_s);
     }
 }
 
@@ -863,18 +805,8 @@ static uint8_t Move_IsTargetReached(void)
             Move_Chassis.Motor[i].
                 Get_Angle_Now();
 
-        const float omega_now =
-            Move_Chassis.Motor[i].
-                Get_Omega_Now();
-
         if (Move_AbsF(angle_error) >
             MOVE_FINISH_ANGLE_TOL_RAD)
-        {
-            return 0U;
-        }
-
-        if (Move_AbsF(omega_now) >
-            MOVE_FINISH_OMEGA_TOL_RAD_S)
         {
             return 0U;
         }

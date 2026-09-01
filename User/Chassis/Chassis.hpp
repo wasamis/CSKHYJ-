@@ -20,7 +20,7 @@
 // #include "trace.hpp"
 
 /*  some define.... -----------------------------------------------------------*/
-#define CHASSIS_MEDIUM_SPEED_UPPERBOUND 300.0f
+#define CHASSIS_MEDIUM_SPEED_UPPERBOUND 600.0f
 
 /*
  * Four-wheel angle-progress synchronization.

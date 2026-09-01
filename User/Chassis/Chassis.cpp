@@ -132,7 +132,7 @@ void Class_Chassis::Init(TIM_HandleTypeDef __Driver_PWM_TIM)
                                 35.0f,
                                 0.0f,
                                 400.0f,
-                                500.0f);
+                                650.0f);
 
         /*
          * 最后一个参数限制了角度环输出，也就是麦轮稳定速度。

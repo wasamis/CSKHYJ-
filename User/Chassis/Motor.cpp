@@ -22,6 +22,12 @@
 #define MOTOR_OMEGA_TARGET_DEADBAND        0.05f
 
 /*
+ * 位置环需要继续运动时的最小驱动占空比。
+ * 用于克服低速末段的电机静摩擦死区。
+ */
+#define MOTOR_ANGLE_MIN_PWM_PERCENT         30
+
+/*
  * Maximum PWM command change in one 20ms control update.
  */
 #define MOTOR_PWM_MAX_STEP_PER_CONTROL     80
@@ -451,6 +457,26 @@ void Class_Motor_With_Hall_Encoder::Calculate_TIM_PeriodElapsedCallback()
         else
         {
             pid_out = 0.0f;
+        }
+
+        const int32_t min_angle_out =
+            (Motor_PWM_Period *
+             MOTOR_ANGLE_MIN_PWM_PERCENT + 99) /
+            100;
+
+        /*
+         * 只对位置环仍然要求运动的非零输出补偿死区。
+         * pid_out == 0 时保持为零，使超调减速和最终停车仍然有效。
+         */
+        if ((pid_out > 0.0f) &&
+            (pid_out < (float)min_angle_out))
+        {
+            pid_out = (float)min_angle_out;
+        }
+        else if ((pid_out < 0.0f) &&
+                 (pid_out > (float)-min_angle_out))
+        {
+            pid_out = (float)-min_angle_out;
         }
 
         desired_out = (int32_t)pid_out;
