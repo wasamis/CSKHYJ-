@@ -17,6 +17,7 @@
 /* USER CODE BEGIN Includes */
 #include "Move.hpp"
 #include "ArmTask.hpp"
+#include "arm.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -90,6 +91,7 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM8_Init();
   MX_TIM6_Init();
+  MX_TIM10_Init();
   /* USER CODE BEGIN 2 */
   Move_Init();
   ArmTask_Init();
@@ -159,6 +161,11 @@ void SystemClock_Config(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   Move_TIM_Callback(htim);
+}
+
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+{
+  Arm_TIM_PWM_PulseFinishedCallback(htim);
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)

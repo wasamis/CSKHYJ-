@@ -137,6 +137,12 @@ Arm_BuildState_t Arm_GetBuildState(void);
 int32_t Arm_GetScrewPositionSteps(void);
 
 /*
+ * main.c 的 HAL_TIM_PWM_PulseFinishedCallback() 调用此函数。
+ * TIM10 中断计步逻辑保留在 arm.c 中。
+ */
+void Arm_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim);
+
+/*
  * 保留原上位机 0x01 接口：
  * 修改腕部 Wrist 的抓取位置。
  * 单位 us，内部限制为 500~2500 us。

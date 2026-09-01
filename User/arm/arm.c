@@ -71,82 +71,66 @@ static const uint16_t g_bus_servo_time_ms[ARM_SERVO_COUNT] = {
 
 /*
  * ============================================================
- * 丝杆搭建电机预设硬件
+ * 丝杆搭建电机：TIM10 PWM + DIR
  * ============================================================
  *
- * 驱动方式：常见 STEP / DIR / EN 步进驱动器
- * 预设引脚（当前 CSKHYJ.ioc 中未占用）：
+ * STEP：
+ *   由 TIM10_CH1 硬件 PWM 输出，不再由 GPIO 软件翻转。
+ *   STEP 引脚必须在 CubeMX 中配置为 TIM10_CH1 复用功能。
  *
- *   STEP -> PF8
- *   DIR  -> PF9
- *   EN   -> PF10
- *
- * 这里在 Arm_Init() 中直接初始化 GPIO，所以你暂时不改 CubeMX 也能编译使用。
- * 后面如果你在 CubeMX 中手动配置这三个脚，保持为推挽输出即可。
+ * DIR：
+ *   仍使用普通 GPIO，当前为 PF9。
  *
  * 重要：
- * 当前没有配置原点限位开关，因此上电时默认机械机构已经实际位于 HOME。
+ * 当前没有原点限位开关，因此上电时默认机械机构已经实际位于 HOME。
  * 如果上电位置不确定，后续建议增加 HOME 限位开关做回零。
  */
-#define ARM_SCREW_STEP_GPIO_PORT                 GPIOF
-#define ARM_SCREW_STEP_GPIO_PIN                  GPIO_PIN_8
-
 #define ARM_SCREW_DIR_GPIO_PORT                  GPIOF
 #define ARM_SCREW_DIR_GPIO_PIN                   GPIO_PIN_9
 
-#define ARM_SCREW_ENABLE_GPIO_PORT               GPIOF
-#define ARM_SCREW_ENABLE_GPIO_PIN                GPIO_PIN_10
+/*
+ * 正、反方向使用两个明确的电平定义。
+ * 不再通过“判断一个电平后再取反”来得到另一个方向。
+ *
+ * 如果实机方向相反，只交换下面两个定义即可。
+ */
+#define ARM_SCREW_DIR_POSITIVE_LEVEL             GPIO_PIN_SET
+#define ARM_SCREW_DIR_NEGATIVE_LEVEL             GPIO_PIN_RESET
 
 /*
  * ============================================================
- * 丝杆位置参数 —— 主要改这里
+ * 丝杆位置参数
  * ============================================================
  *
- * 单位：STEP 脉冲数（软件位置）
- *
- * HOME_POSITION_STEPS：
- *   你定义的初始位置。
- *
- * BUILD_POSITION_STEPS：
- *   搭建时丝杆需要到达的位置。
- *
- * 例如：
- *   HOME  = 0
- *   BUILD = 2000
- *
- * 就表示收到 Community 搭建请求后正向走 2000 步，然后自动回到 0。
- *
- * BUILD 也可以小于 HOME，代码会自动判断方向。
+ * 单位：TIM10 输出的 STEP 脉冲数。
  */
 #define ARM_SCREW_HOME_POSITION_STEPS            0L
-#define ARM_SCREW_BUILD_POSITION_STEPS           2000L
+#define ARM_SCREW_BUILD_POSITION_STEPS           100000L
 
 /*
- * STEP 脉冲速度。
- * 当前每个高/低电平各保持 1 ms，约 500 step/s。
- * 想慢一点就把这两个值调大。
+ * ============================================================
+ * TIM10 STEP 频率
+ * ============================================================
+ *
+ * 这里直接指定目标 STEP 频率。
+ * Arm_Init() 会根据当前 APB2 定时器时钟自动计算 PSC / ARR / CCR1。
+ *
+ * 5000 Hz 表示每秒输出 5000 个 STEP 脉冲。
+ * 后续想提速时优先改这个值。
  */
-#define ARM_SCREW_STEP_HIGH_TIME_MS              1U
-#define ARM_SCREW_STEP_LOW_TIME_MS               1U
+#define ARM_SCREW_STEP_FREQUENCY_HZ              5000U
+
+/*
+ * TIM10 计数器目标基准时钟。
+ * 优先让 TIM10 计数频率接近 2 MHz，既有足够分辨率，
+ * 又能覆盖常见步进驱动器的 STEP 频率范围。
+ */
+#define ARM_SCREW_TIM_COUNTER_TARGET_HZ           2000000U
 
 /*
  * 到达搭建位置后的停留时间。
- * 如果“到位立即返回”就改成 0U。
  */
 #define ARM_SCREW_BUILD_HOLD_MS                  200U
-
-/*
- * DIR 正方向电平。
- * 如果实际运动方向和你想的相反，改成 GPIO_PIN_RESET。
- */
-#define ARM_SCREW_DIR_POSITIVE_LEVEL             GPIO_PIN_SET
-
-/*
- * 常见 EN 为低有效。
- * 如果你的驱动器 EN 为高有效，把下面两个定义对调。
- */
-#define ARM_SCREW_ENABLE_ACTIVE_LEVEL             GPIO_PIN_RESET
-#define ARM_SCREW_ENABLE_INACTIVE_LEVEL           GPIO_PIN_SET
 
 /*
  * ============================================================
@@ -237,7 +221,7 @@ static const uint16_t g_bus_servo_time_ms[ARM_SERVO_COUNT] = {
 
 /*
  * 为防止浮点误差导致 acos 输入略超 [-1,1]。
- */
+*/
 #define ARM_IK_EPSILON                         0.0001f
 
 #define ARM_PI_F                               3.14159265358979323846f
@@ -360,9 +344,7 @@ typedef struct
     int32_t current_position_steps;
     int32_t target_position_steps;
     int8_t step_direction;
-
-    uint8_t step_pin_high;
-    uint32_t last_edge_tick;
+    uint8_t running;
 
 } Arm_ScrewMotion_t;
 
@@ -393,7 +375,7 @@ static Arm_BuildState_t s_build_state =
 
 static uint32_t s_build_hold_start_tick = 0U;
 
-static Arm_ScrewMotion_t s_screw_motion;
+static volatile Arm_ScrewMotion_t s_screw_motion;
 
 /*
  * ============================================================
@@ -451,7 +433,7 @@ static uint8_t Arm_ApplyLiftPoint(float x_cm,
 
 /* 丝杆搭建 */
 static void Arm_ScrewGPIOInit(void);
-static void Arm_ScrewSetEnable(uint8_t enable);
+static uint8_t Arm_ScrewConfigureTim10(uint32_t step_frequency_hz);
 static void Arm_ScrewSetTarget(int32_t target_steps);
 static uint8_t Arm_ScrewUpdateMotion(void);
 static void Arm_ScrewStopMotion(void);
@@ -485,118 +467,25 @@ static void Arm_FinishSequence(void);
  * ============================================================
  */
 
-/*void Arm_Init(void)
-{
-    uint32_t i;
-
-    /*
-     * 初始化丝杆 STEP / DIR / EN GPIO。
-     */
-   /* Arm_ScrewGPIOInit();
-
-    for (i = 0U; i < (uint32_t)ARM_SERVO_COUNT; i++)
-    {
-        s_servo_motion[i].current_us = 1500U;
-        s_servo_motion[i].start_us = 1500U;
-        s_servo_motion[i].target_us = 1500U;
-
-        s_servo_motion[i].start_tick = 0U;
-        s_servo_motion[i].duration_ms = 0U;
-
-        s_servo_motion[i].active = 0U;
-    }
-
-    /*
-     * 上电初始位置。
-     *
-     * 按之前要求：
-     * 夹爪上电后处于夹紧状态。
-     */
-   /* Arm_WriteServoUs(
-        ARM_SERVO_1_BASE,
-        ARM_S1_BASE_HOME_US);
-
-    Arm_WriteServoUs(
-        ARM_SERVO_2_SHOULDER,
-        ARM_S2_SHOULDER_HOME_US);
-
-    Arm_WriteServoUs(
-        ARM_SERVO_3_ELBOW,
-        ARM_S3_ELBOW_HOME_US);
-
-    Arm_WriteServoUs(
-        ARM_SERVO_4_WRIST,
-        ARM_S4_WRIST_HOME_US);
-
-    Arm_WriteServoUs(
-        ARM_SERVO_5_GRIPPER,
-        ARM_S5_GRIPPER_CLOSE_US);
-
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
-
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-
-    /*
-     * TIM3_CH2 / CH3 / CH4 留给其他模块。
-     */
-
-    /* s_arm_busy = 0U;
-    s_arm_finished = 0U;
-
-    s_arm_state = ARM_STATE_IDLE;
-    s_arm_start_tick = 0U;
-
-    s_wrist_pick_position =
-        ARM_S4_WRIST_PICK_DEFAULT_US;
-
-    s_vertical_lift.active = 0U;
-    s_vertical_lift.start_tick = 0U;
-    s_vertical_lift.duration_ms = 0U;
-    s_vertical_lift.start_x_cm = 0.0f;
-    s_vertical_lift.start_z_cm = 0.0f;
-    s_vertical_lift.lift_height_cm = 0.0f;
-    s_vertical_lift.tool_angle_rad = 0.0f;
-    s_vertical_lift.start_elbow_relative_rad = 0.0f;
-
-    /*
-     * 上电后把“软件当前位置”定义为 HOME。
-     * 当前没有原点开关，所以实机上电前也应让丝杆机构位于 HOME。
-     */
-    /* s_build_busy = 0U;
-    s_build_finished = 0U;
-    s_build_state = ARM_BUILD_STATE_IDLE;
-    s_build_hold_start_tick = 0U;
-
-    s_screw_motion.current_position_steps =
-        ARM_SCREW_HOME_POSITION_STEPS;
-
-    s_screw_motion.target_position_steps =
-        ARM_SCREW_HOME_POSITION_STEPS;
-
-    s_screw_motion.step_direction = 1;
-    s_screw_motion.step_pin_high = 0U;
-    s_screw_motion.last_edge_tick = HAL_GetTick();
-
-    Arm_ScrewSetEnable(0U);
-}*/
-
-/*
- * ============================================================
- * 初始化
- * ============================================================
- */
-
 void Arm_Init(void)
 {
     uint32_t i;
 
     // ============================================================
-    // 1. 初始化丝杆 STEP / DIR / EN GPIO（原有功能）
+    // 1. 初始化丝杆 STEP / DIR GPIO
     // ============================================================
     Arm_ScrewGPIOInit();
+
+    /*
+     * 丝杆 STEP 由 TIM10_CH1 硬件 PWM 输出。
+     * 平时关闭；运动时由 Arm_ScrewSetTarget() 启动。
+     */
+    HAL_TIM_PWM_Stop_IT(&htim10, TIM_CHANNEL_1);
+
+    if (Arm_ScrewConfigureTim10(ARM_SCREW_STEP_FREQUENCY_HZ) == 0U)
+    {
+        Error_Handler();
+    }
 
     // ============================================================
     // 2. 初始化PWM舵机（底座、夹爪）
@@ -692,10 +581,8 @@ void Arm_Init(void)
     s_screw_motion.current_position_steps = ARM_SCREW_HOME_POSITION_STEPS;
     s_screw_motion.target_position_steps = ARM_SCREW_HOME_POSITION_STEPS;
     s_screw_motion.step_direction = 1;
-    s_screw_motion.step_pin_high = 0U;
-    s_screw_motion.last_edge_tick = HAL_GetTick();
+    s_screw_motion.running = 0U;
 
-    Arm_ScrewSetEnable(0U);
 }
 
 /*
@@ -739,8 +626,6 @@ uint8_t Arm_StartBuild(void)
 
     s_build_finished = 0U;
     s_build_busy = 1U;
-
-    Arm_ScrewSetEnable(1U);
 
     Arm_ScrewSetTarget(
         ARM_SCREW_BUILD_POSITION_STEPS);
@@ -1335,162 +1220,256 @@ void Arm_SetPoseImmediate(uint16_t base_us,
 
 /*
  * ============================================================
- * 丝杆 STEP / DIR / EN 底层
+ * 丝杆 TIM10 PWM / DIR 底层
  * ============================================================
  */
 
 static void Arm_ScrewGPIOInit(void)
 {
-    GPIO_InitTypeDef gpio_init;
+    GPIO_InitTypeDef gpio_init = {0};
 
     __HAL_RCC_GPIOF_CLK_ENABLE();
 
     /*
-     * 三个预设脚都在 GPIOF。
-     * 如果后面你换到别的 GPIO 端口，需要同时打开对应端口时钟。
+     * STEP 不再在这里配置为普通 GPIO。
+     * STEP 由 CubeMX 生成的 TIM10_CH1 复用功能负责。
+     *
+     * 这里只配置 DIR。
      */
-    gpio_init.Pin =
-        ARM_SCREW_STEP_GPIO_PIN |
-        ARM_SCREW_DIR_GPIO_PIN |
-        ARM_SCREW_ENABLE_GPIO_PIN;
-
+    gpio_init.Pin = ARM_SCREW_DIR_GPIO_PIN;
     gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
     gpio_init.Pull = GPIO_NOPULL;
-    gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio_init.Speed = GPIO_SPEED_FREQ_HIGH;
 
     HAL_GPIO_Init(
-        ARM_SCREW_STEP_GPIO_PORT,
+        ARM_SCREW_DIR_GPIO_PORT,
         &gpio_init);
-
-    HAL_GPIO_WritePin(
-        ARM_SCREW_STEP_GPIO_PORT,
-        ARM_SCREW_STEP_GPIO_PIN,
-        GPIO_PIN_RESET);
 
     HAL_GPIO_WritePin(
         ARM_SCREW_DIR_GPIO_PORT,
         ARM_SCREW_DIR_GPIO_PIN,
         ARM_SCREW_DIR_POSITIVE_LEVEL);
-
-    HAL_GPIO_WritePin(
-        ARM_SCREW_ENABLE_GPIO_PORT,
-        ARM_SCREW_ENABLE_GPIO_PIN,
-        ARM_SCREW_ENABLE_INACTIVE_LEVEL);
 }
 
-static void Arm_ScrewSetEnable(uint8_t enable)
+/*
+ * 根据当前 APB2 时钟自动配置 TIM10。
+ *
+ * STM32F4 中，如果 APB2 分频不为 1，则 APB2 上的定时器时钟
+ * 等于 PCLK2 的 2 倍。
+ *
+ * 返回：
+ *   1 = 配置成功
+ *   0 = 参数非法 / 无法得到有效 PSC、ARR
+ */
+static uint8_t Arm_ScrewConfigureTim10(uint32_t step_frequency_hz)
 {
-    HAL_GPIO_WritePin(
-        ARM_SCREW_ENABLE_GPIO_PORT,
-        ARM_SCREW_ENABLE_GPIO_PIN,
-        (enable != 0U) ?
-            ARM_SCREW_ENABLE_ACTIVE_LEVEL :
-            ARM_SCREW_ENABLE_INACTIVE_LEVEL);
+    RCC_ClkInitTypeDef clock_config;
+    uint32_t flash_latency;
+    uint32_t pclk2_hz;
+    uint32_t tim10_clock_hz;
+    uint32_t prescaler_div;
+    uint32_t timer_counter_hz;
+    uint32_t period_counts;
+    uint32_t arr;
+    uint32_t pulse;
+
+    if (step_frequency_hz == 0U)
+    {
+        return 0U;
+    }
+
+    HAL_RCC_GetClockConfig(
+        &clock_config,
+        &flash_latency);
+
+    pclk2_hz = HAL_RCC_GetPCLK2Freq();
+
+    if (clock_config.APB2CLKDivider == RCC_HCLK_DIV1)
+    {
+        tim10_clock_hz = pclk2_hz;
+    }
+    else
+    {
+        tim10_clock_hz = pclk2_hz * 2U;
+    }
+
+    /*
+     * 让 TIM10 计数时钟尽量接近 2 MHz。
+     * prescaler_div 对应 (PSC + 1)。
+     */
+    prescaler_div =
+        (tim10_clock_hz +
+         (ARM_SCREW_TIM_COUNTER_TARGET_HZ / 2U)) /
+        ARM_SCREW_TIM_COUNTER_TARGET_HZ;
+
+    if (prescaler_div == 0U)
+    {
+        prescaler_div = 1U;
+    }
+
+    if (prescaler_div > 65536U)
+    {
+        return 0U;
+    }
+
+    timer_counter_hz =
+        tim10_clock_hz / prescaler_div;
+
+    period_counts =
+        (timer_counter_hz +
+         (step_frequency_hz / 2U)) /
+        step_frequency_hz;
+
+    /*
+     * PWM 至少需要两个计数：
+     * 一个高电平区间 + 一个低电平区间。
+     */
+    if (period_counts < 2U)
+    {
+        period_counts = 2U;
+    }
+
+    if (period_counts > 65536U)
+    {
+        return 0U;
+    }
+
+    arr = period_counts - 1U;
+
+    /*
+     * 约 50% 占空比。
+     */
+    pulse = period_counts / 2U;
+
+    if (pulse == 0U)
+    {
+        pulse = 1U;
+    }
+
+    __HAL_TIM_DISABLE(&htim10);
+
+    __HAL_TIM_SET_PRESCALER(
+        &htim10,
+        prescaler_div - 1U);
+
+    __HAL_TIM_SET_AUTORELOAD(
+        &htim10,
+        arr);
+
+    __HAL_TIM_SET_COMPARE(
+        &htim10,
+        TIM_CHANNEL_1,
+        pulse);
+
+    __HAL_TIM_SET_COUNTER(
+        &htim10,
+        0U);
+
+    __HAL_TIM_CLEAR_FLAG(
+        &htim10,
+        TIM_FLAG_CC1 | TIM_FLAG_UPDATE);
+
+    /*
+     * PSC 的新值需要通过更新事件装载。
+     * 此时 PWM 通道尚未启动，因此不会额外输出 STEP。
+     */
+    htim10.Instance->EGR = TIM_EGR_UG;
+
+    __HAL_TIM_CLEAR_FLAG(
+        &htim10,
+        TIM_FLAG_CC1 | TIM_FLAG_UPDATE);
+
+    return 1U;
 }
 
 static void Arm_ScrewSetTarget(int32_t target_steps)
 {
-    GPIO_PinState dir_level;
+    int32_t current_steps;
+    uint32_t first_counter;
+
+    /*
+     * 先停止上一段 PWM，保证改变 DIR 时 STEP 不在输出。
+     */
+    HAL_TIM_PWM_Stop_IT(
+        &htim10,
+        TIM_CHANNEL_1);
+
+    s_screw_motion.running = 0U;
+
+    current_steps =
+        s_screw_motion.current_position_steps;
 
     s_screw_motion.target_position_steps =
         target_steps;
 
-    if (target_steps >=
-        s_screw_motion.current_position_steps)
+    if (target_steps == current_steps)
+    {
+        return;
+    }
+
+    if (target_steps > current_steps)
     {
         s_screw_motion.step_direction = 1;
-        dir_level = ARM_SCREW_DIR_POSITIVE_LEVEL;
+
+        HAL_GPIO_WritePin(
+            ARM_SCREW_DIR_GPIO_PORT,
+            ARM_SCREW_DIR_GPIO_PIN,
+            ARM_SCREW_DIR_POSITIVE_LEVEL);
     }
     else
     {
         s_screw_motion.step_direction = -1;
 
-        dir_level =
-            (ARM_SCREW_DIR_POSITIVE_LEVEL == GPIO_PIN_SET) ?
-            GPIO_PIN_RESET :
-            GPIO_PIN_SET;
+        HAL_GPIO_WritePin(
+            ARM_SCREW_DIR_GPIO_PORT,
+            ARM_SCREW_DIR_GPIO_PIN,
+            ARM_SCREW_DIR_NEGATIVE_LEVEL);
     }
 
-    HAL_GPIO_WritePin(
-        ARM_SCREW_DIR_GPIO_PORT,
-        ARM_SCREW_DIR_GPIO_PIN,
-        dir_level);
+    /*
+     * 从 CCR1 位置启动：
+     * PWM Mode 1 下此时输出处于低电平区间，
+     * 会先等待大约半个 STEP 周期再产生第一个上升沿。
+     *
+     * 这样给 DIR 留出建立时间，避免改变方向后立刻出现 STEP 上升沿。
+     */
+    first_counter =
+        __HAL_TIM_GET_COMPARE(
+            &htim10,
+            TIM_CHANNEL_1);
+
+    __HAL_TIM_SET_COUNTER(
+        &htim10,
+        first_counter);
+
+    __HAL_TIM_CLEAR_FLAG(
+        &htim10,
+        TIM_FLAG_CC1 | TIM_FLAG_UPDATE);
+
+    s_screw_motion.running = 1U;
 
     /*
-     * 每次开始新一段运动都保证 STEP 从低电平起步。
+     * TIM10_CH1 自动输出 STEP；
+     * CC1 中断每个 PWM 周期只计一次。
      */
-    HAL_GPIO_WritePin(
-        ARM_SCREW_STEP_GPIO_PORT,
-        ARM_SCREW_STEP_GPIO_PIN,
-        GPIO_PIN_RESET);
+    if (HAL_TIM_PWM_Start_IT(
+            &htim10,
+            TIM_CHANNEL_1) != HAL_OK)
+    {
+        s_screw_motion.running = 0U;
 
-    s_screw_motion.step_pin_high = 0U;
-    s_screw_motion.last_edge_tick =
-        HAL_GetTick();
+        s_screw_motion.target_position_steps =
+            s_screw_motion.current_position_steps;
+    }
 }
 
 static uint8_t Arm_ScrewUpdateMotion(void)
 {
-    uint32_t now_tick;
-    uint32_t elapsed;
-
-    now_tick = HAL_GetTick();
-
-    elapsed =
-        (uint32_t)(
-            now_tick -
-            s_screw_motion.last_edge_tick);
-
-    if (s_screw_motion.step_pin_high == 0U)
+    if ((s_screw_motion.running == 0U) &&
+        (s_screw_motion.current_position_steps ==
+         s_screw_motion.target_position_steps))
     {
-        if (s_screw_motion.current_position_steps ==
-            s_screw_motion.target_position_steps)
-        {
-            return 1U;
-        }
-
-        if (elapsed >= ARM_SCREW_STEP_LOW_TIME_MS)
-        {
-            /*
-             * 上升沿触发大多数 STEP/DIR 驱动器走一步。
-             * 因此软件位置也在这里同步加/减一步。
-             */
-            HAL_GPIO_WritePin(
-                ARM_SCREW_STEP_GPIO_PORT,
-                ARM_SCREW_STEP_GPIO_PIN,
-                GPIO_PIN_SET);
-
-            s_screw_motion.step_pin_high = 1U;
-            s_screw_motion.last_edge_tick =
-                now_tick;
-
-            s_screw_motion.current_position_steps +=
-                (int32_t)s_screw_motion.step_direction;
-        }
-    }
-    else
-    {
-        if (elapsed >= ARM_SCREW_STEP_HIGH_TIME_MS)
-        {
-            HAL_GPIO_WritePin(
-                ARM_SCREW_STEP_GPIO_PORT,
-                ARM_SCREW_STEP_GPIO_PIN,
-                GPIO_PIN_RESET);
-
-            s_screw_motion.step_pin_high = 0U;
-            s_screw_motion.last_edge_tick =
-                now_tick;
-
-            /*
-             * 即使刚刚已经到目标，也先保证高电平宽度完整，
-             * 再在这个下降沿后报告“到位”。
-             */
-            if (s_screw_motion.current_position_steps ==
-                s_screw_motion.target_position_steps)
-            {
-                return 1U;
-            }
-        }
+        return 1U;
     }
 
     return 0U;
@@ -1498,20 +1477,18 @@ static uint8_t Arm_ScrewUpdateMotion(void)
 
 static void Arm_ScrewStopMotion(void)
 {
-    HAL_GPIO_WritePin(
-        ARM_SCREW_STEP_GPIO_PORT,
-        ARM_SCREW_STEP_GPIO_PIN,
-        GPIO_PIN_RESET);
+    HAL_TIM_PWM_Stop_IT(
+        &htim10,
+        TIM_CHANNEL_1);
 
-    s_screw_motion.step_pin_high = 0U;
+    s_screw_motion.running = 0U;
 
     /*
-     * STOP 后不再继续追原目标。
+     * 手动 STOP 时取消尚未完成的目标。
+     * 已经输出过的 STEP 数保留为当前位置。
      */
     s_screw_motion.target_position_steps =
         s_screw_motion.current_position_steps;
-
-    Arm_ScrewSetEnable(0U);
 }
 
 static void Arm_FinishBuildSequence(void)
@@ -2561,3 +2538,45 @@ static void Arm_FinishSequence(void)
     s_arm_state =
         ARM_STATE_IDLE;
 }
+
+
+void Arm_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+{
+    if ((htim == NULL) ||
+        (htim->Instance != TIM10))
+    {
+        return;
+    }
+
+    if (s_screw_motion.running == 0U)
+    {
+        return;
+    }
+
+    if (s_screw_motion.current_position_steps ==
+        s_screw_motion.target_position_steps)
+    {
+        Arm_ScrewStopMotion();
+        return;
+    }
+
+    /*
+     * HAL_TIM_PWM_Start_IT() 为 TIM10_CH1 开启 CC1 中断。
+     *
+     * PWM Mode 1 下，每个 PWM 周期只有一次 CC1 比较事件，
+     * 因此这里每进入一次就代表已经输出了一个完整的 STEP 高电平。
+     */
+    s_screw_motion.current_position_steps +=
+        (int32_t)s_screw_motion.step_direction;
+
+    if (s_screw_motion.current_position_steps ==
+        s_screw_motion.target_position_steps)
+    {
+        /*
+         * 当前 STEP 已经完成，立即关闭后续 PWM 周期。
+         * 因此不会多输出一个脉冲。
+         */
+        Arm_ScrewStopMotion();
+    }
+}
+
