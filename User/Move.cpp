@@ -467,7 +467,7 @@ extern "C" void Move_TIM_Callback(
 
 /*
  * ============================================================
- * USART1 callbacks
+ * USART1 / USART3 callbacks
  * ============================================================
  */
 
@@ -479,9 +479,10 @@ extern "C" void Move_UART_RxCpltCallback(
         return;
     }
 
-    if (huart->Instance == USART1)
+    if ((huart->Instance == USART1) ||
+        (huart->Instance == USART3))
     {
-        Receive_Analyse();
+        Receive_Analyse(huart);
     }
 }
 
@@ -493,9 +494,10 @@ extern "C" void Move_UART_ErrorCallback(
         return;
     }
 
-    if (huart->Instance == USART1)
+    if ((huart->Instance == USART1) ||
+        (huart->Instance == USART3))
     {
-        Community_RestartReceive();
+        Community_RestartReceive(huart);
     }
 }
 

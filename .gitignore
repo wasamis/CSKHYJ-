@@ -8,5 +8,6 @@
 !User/
 !User/**
 !*.ioc
+!*.py
 !CSKHYJ.uvprojx
 !.gitignore

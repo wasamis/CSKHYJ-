@@ -9,7 +9,8 @@
  * ============================================================
  */
 
-static uint8_t s_uart_rx_byte = 0U;
+static uint8_t s_uart1_rx_byte = 0U;
+static uint8_t s_uart3_rx_byte = 0U;
 
 /*
  * ============================================================
@@ -105,22 +106,65 @@ void Community_Init(void)
     s_arm_build_active = 0U;
     s_suppress_next_general_finish = 0U;
 
-    Community_RestartReceive();
+    Community_RestartReceive(&huart1);
+    Community_RestartReceive(&huart3);
 }
 
-void Community_RestartReceive(void)
+void Community_RestartReceive(UART_HandleTypeDef *huart)
 {
-    HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U);
+    if (huart == NULL)
+    {
+        return;
+    }
+
+    if (huart->Instance == USART1)
+    {
+        HAL_UART_Receive_IT(
+            &huart1,
+            &s_uart1_rx_byte,
+            1U);
+    }
+    else if (huart->Instance == USART3)
+    {
+        HAL_UART_Receive_IT(
+            &huart3,
+            &s_uart3_rx_byte,
+            1U);
+    }
 }
 
 /*
- * USART1 每收到 1 字节后，
+ * USART1 / USART3 每收到 1 字节后，
  * Move_UART_RxCpltCallback() 会调用 Receive_Analyse()。
  */
-void Receive_Analyse(void)
+void Receive_Analyse(UART_HandleTypeDef *huart)
 {
-    Community_RxByte(s_uart_rx_byte);
-    Community_RestartReceive();
+    uint8_t data;
+
+    if (huart == NULL)
+    {
+        return;
+    }
+
+    if (huart->Instance == USART1)
+    {
+        data = s_uart1_rx_byte;
+    }
+    else if (huart->Instance == USART3)
+    {
+        data = s_uart3_rx_byte;
+    }
+    else
+    {
+        return;
+    }
+
+    /*
+     * 蓝牙只发送一次完整启动帧，之后由 OpenMV 发送命令。
+     * 两路不会交叉发帧，因此可共用原有协议解析状态和任务队列。
+     */
+    Community_RxByte(data);
+    Community_RestartReceive(huart);
 }
 
 void Community_RxByte(uint8_t data)
@@ -329,7 +373,7 @@ void Community_SendSimpleFrame(uint8_t cmd)
     tx[2] = cmd;
 
     HAL_UART_Transmit(
-        &huart1,
+        &huart3,
         tx,
         sizeof(tx),
         20U);

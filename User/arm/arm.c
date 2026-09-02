@@ -106,7 +106,7 @@ static const uint16_t g_bus_servo_time_ms[ARM_SERVO_COUNT] = {
  * 单位：TIM10 输出的 STEP 脉冲数。
  */
 #define ARM_SCREW_HOME_POSITION_STEPS            0L
-#define ARM_SCREW_BUILD_POSITION_STEPS           140000L
+#define ARM_SCREW_BUILD_POSITION_STEPS           130000L
 
 /*
  * ============================================================

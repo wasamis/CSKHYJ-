@@ -93,6 +93,7 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM10_Init();
   MX_TIM12_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   Move_Init();
   ArmTask_Init();

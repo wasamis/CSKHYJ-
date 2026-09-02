@@ -109,8 +109,8 @@ typedef struct
 void Community_Init(void);
 
 void Community_RxByte(uint8_t data);
-void Community_RestartReceive(void);
-void Receive_Analyse(void);
+void Community_RestartReceive(UART_HandleTypeDef *huart);
+void Receive_Analyse(UART_HandleTypeDef *huart);
 
 uint8_t Mission_Queue(Community_Mission_t *mission);
 uint8_t Community_PushMission(const Community_Mission_t *mission);
