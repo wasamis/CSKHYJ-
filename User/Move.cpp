@@ -699,12 +699,12 @@ static void Move_ProcessLineTrace(
 
     switch (command.type)
     {
-    case LINETRACE_COMMAND_MOVE_FORWARD_CM:
+    case LINETRACE_COMMAND_MOVE_CM:
     {
         if (s_move_active == 0U)
         {
             Move_StartTranslate(
-                0U,
+                command.angle_deg,
                 command.distance_cm);
         }
 

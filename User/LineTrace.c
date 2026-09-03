@@ -10,8 +10,10 @@
  *   2. 右转  90 deg
  *   3. 向前 273 cm
  *   4. 左转  90 deg
- *   5. 向前 201 cm
- *   6. 停止并上报完成
+ *   5. 向前 208 cm
+ *   6. 斜左前方平移：左50 cm + 前70 cm
+ *      合成为方向 36 deg、距离 86 cm
+ *   7. 停止并上报完成
  *
  * 实车已标定：正角度为右转，负角度为左转。
  */
@@ -19,18 +21,27 @@
 typedef struct
 {
     LineTrace_CommandType_t type;
+    uint16_t angle_deg;
     uint16_t distance_cm;
     int16_t rotate_deg;
 
 } LineTrace_Step_t;
 
+
+// static const LineTrace_Step_t s_initial_steps[] =
+// {
+//     {LINETRACE_COMMAND_MOVE_CM,       0U,  90U,   0},
+//     {LINETRACE_COMMAND_ROTATE_DEG,    0U,   0U,  88},
+//     {LINETRACE_COMMAND_MOVE_CM,       0U, 273U,   0},
+//     {LINETRACE_COMMAND_ROTATE_DEG,    0U,   0U, -90},
+//     {LINETRACE_COMMAND_MOVE_CM,       0U, 208U,   0},
+//     {LINETRACE_COMMAND_MOVE_CM,      270U,  100U,   0},
+//     {LINETRACE_COMMAND_MOVE_CM,      0U,  100U,   0}
+// };
+
 static const LineTrace_Step_t s_initial_steps[] =
 {
-    {LINETRACE_COMMAND_MOVE_FORWARD_CM,  90U,   0},
-    {LINETRACE_COMMAND_ROTATE_DEG,        0U,  88},
-    {LINETRACE_COMMAND_MOVE_FORWARD_CM, 273U,   0},
-    {LINETRACE_COMMAND_ROTATE_DEG,        0U, -90},
-    {LINETRACE_COMMAND_MOVE_FORWARD_CM, 208U,   0}
+    {LINETRACE_COMMAND_MOVE_CM,       0U,  10U,   0},
 };
 
 #define LINETRACE_INITIAL_STEP_COUNT \
@@ -173,6 +184,7 @@ static void LineTrace_IssueCurrentStep(
         &s_initial_steps[s_step_index];
 
     command->type = step->type;
+    command->angle_deg = step->angle_deg;
     command->distance_cm = step->distance_cm;
     command->rotate_deg = step->rotate_deg;
 }

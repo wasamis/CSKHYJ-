@@ -377,6 +377,12 @@ void Community_SendSimpleFrame(uint8_t cmd)
         tx,
         sizeof(tx),
         20U);
+
+    HAL_UART_Transmit(
+        &huart1,
+        tx,
+        sizeof(tx),
+        20U);
 }
 
 void Community_SendFinish(void)

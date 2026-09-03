@@ -36,7 +36,7 @@ MIN_VALID_FORWARD_CM = 28.0
 MAX_VALID_FORWARD_CM = 75.0
 
 # Stable-window and safety settings.
-FILTER_WINDOW = 15
+FILTER_WINDOW = 3
 MAX_CX_RANGE_PX = 6
 MAX_CY_RANGE_PX = 6
 MAX_W_RANGE_PX = 5
@@ -53,8 +53,25 @@ SETTLE_AFTER_DONE_MS = 500
 WAIT_DONE_TIMEOUT_MS = 15000
 PRINT_EVERY_N_FRAMES = 5
 
+# After each 0x82 completion frame, allow this much time to obtain the
+# 3-frame stable target. If no stable target is available, move one
+# search step and try again after the MCU reports the next 0x82.
+NO_TARGET_SEARCH_TIMEOUT_MS = 500
+NO_TARGET_SEARCH_DISTANCE_CM = 10
+
+# Protocol angle 90 degrees means "left". The real chassis currently has its
+# lateral direction reversed, so this command moves the real vehicle right.
+NO_TARGET_SEARCH_COMMAND_ANGLE_DEG = 90
+
+# Set False when debugging vision without allowing automatic chassis movement.
+ENABLE_NO_TARGET_SEARCH = True
+
 # UART3 on OpenMV H7 Plus: TX=P4, RX=P5, 3.3 V logic, common ground.
 UART_BAUDRATE = 115200
+
+# True: wait for the MCU frame 66 66 82 before initializing the camera.
+# False: initialize the camera immediately, which is convenient for debugging.
+WAIT_MCU_82_BEFORE_CAMERA = True
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
@@ -224,6 +241,49 @@ def print_frame(frame):
 
 uart = UART(3, UART_BAUDRATE, timeout_char=10)
 
+
+def wait_for_camera_start():
+    """
+    Do not initialize or capture from the camera until the MCU reports that
+    the initial chassis task has finished with the frame 66 66 82.
+    """
+    start_rx_state = 0
+
+    print("WAITING_CAMERA_START: 66 66 82")
+
+    while True:
+        while uart.any():
+            value = uart.readchar()
+            if value < 0:
+                break
+
+            if start_rx_state == 0:
+                if value == 0x66:
+                    start_rx_state = 1
+            elif start_rx_state == 1:
+                if value == 0x66:
+                    start_rx_state = 2
+                else:
+                    start_rx_state = 0
+            else:
+                if value == 0x82:
+                    print("CAMERA_START: 66 66 82")
+                    return
+
+                # Keep the last two 0x66 bytes as a possible new header.
+                if value == 0x66:
+                    start_rx_state = 2
+                else:
+                    start_rx_state = 0
+
+        time.sleep_ms(10)
+
+
+if WAIT_MCU_82_BEFORE_CAMERA:
+    wait_for_camera_start()
+else:
+    print("CAMERA_START_WAIT_DISABLED")
+
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
 sensor.set_framesize(sensor.QVGA)
@@ -330,6 +390,37 @@ def send_one_move(move):
     )
 
 
+def search_right_if_timed_out():
+    if not ENABLE_NO_TARGET_SEARCH:
+        return False
+
+    if state != STATE_STABILIZE:
+        return False
+
+    if pyb.elapsed_millis(state_started_ms) < NO_TARGET_SEARCH_TIMEOUT_MS:
+        return False
+
+    print(
+        "NO_STABLE_TARGET_%dMS: search right %d cm "
+        "using protocol-left angle %d deg"
+        % (
+            NO_TARGET_SEARCH_TIMEOUT_MS,
+            NO_TARGET_SEARCH_DISTANCE_CM,
+            NO_TARGET_SEARCH_COMMAND_ANGLE_DEG,
+        )
+    )
+
+    send_one_move(
+        (
+            0.0,
+            0.0,
+            float(NO_TARGET_SEARCH_COMMAND_ANGLE_DEG),
+            float(NO_TARGET_SEARCH_DISTANCE_CM),
+        )
+    )
+    return True
+
+
 print("TARGET: forward=38 cm, left=12 cm; translation only")
 print("Waiting for one stable target...")
 
@@ -391,6 +482,7 @@ while True:
         target_filter.clear()
         if should_print:
             print("BOTH_TARGETS_NO_COMMAND")
+        search_right_if_timed_out()
         continue
 
     if selected is None:
@@ -398,12 +490,14 @@ while True:
         aligned_reported = False
         if should_print:
             print("NO_TARGET")
+        search_right_if_timed_out()
         continue
 
     if not blob_is_complete(selected):
         target_filter.clear()
         if should_print:
             print("TARGET_TOUCHES_EDGE_OR_BAD_SHAPE_NO_COMMAND")
+        search_right_if_timed_out()
         continue
 
     target_filter.add(label, selected)
@@ -411,6 +505,7 @@ while True:
     if stable is None:
         if should_print:
             print("STABILIZING: %d/%d" % (len(target_filter.samples), FILTER_WINDOW))
+        search_right_if_timed_out()
         continue
 
     stable_label = stable[0]
@@ -422,6 +517,7 @@ while True:
     pose = estimate_target_pose(cx, width)
     if pose is None:
         target_filter.clear()
+        search_right_if_timed_out()
         continue
 
     forward_cm = pose[0]
@@ -457,6 +553,7 @@ while True:
     ):
         if should_print:
             print("OUTSIDE_30_TO_70_CM_CALIBRATION_NO_COMMAND")
+        search_right_if_timed_out()
         continue
 
     if (

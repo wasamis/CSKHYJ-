@@ -16,7 +16,7 @@ extern "C" {
 typedef enum
 {
     LINETRACE_COMMAND_NONE = 0,
-    LINETRACE_COMMAND_MOVE_FORWARD_CM,
+    LINETRACE_COMMAND_MOVE_CM,
     LINETRACE_COMMAND_ROTATE_DEG,
     LINETRACE_COMMAND_STOP,
 
@@ -25,6 +25,7 @@ typedef enum
 typedef struct
 {
     LineTrace_CommandType_t type;
+    uint16_t angle_deg;
     uint16_t distance_cm;
     int16_t rotate_deg;
 
