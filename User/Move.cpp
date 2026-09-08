@@ -113,6 +113,8 @@ static volatile uint8_t s_task_finished_pending = 0U;
  * has finished.
  */
 static uint8_t s_all_done_reported = 1U;
+static uint8_t s_all_done_command =
+    COMMUNITY_TX_CHASSIS_ALL_DONE;
 
 /*
  * ============================================================
@@ -178,6 +180,8 @@ extern "C" void Move_Init(void)
     s_task_finished_pending = 0U;
 
     s_all_done_reported = 1U;
+    s_all_done_command =
+        COMMUNITY_TX_CHASSIS_ALL_DONE;
 
     /*
      * TIM6 must be configured as a 20ms base timer
@@ -222,6 +226,8 @@ extern "C" void Move_Process(void)
          * Main loop will send 0x82 once.
          */
         s_all_done_reported = 0U;
+        s_all_done_command =
+            COMMUNITY_TX_CHASSIS_ALL_DONE;
 
         Community_SendDebugString(
             "Move STOP\r\n");
@@ -311,6 +317,9 @@ extern "C" void Move_Process(void)
         case COMMUNITY_MISSION_CHASSIS_MOVE:
         case COMMUNITY_MISSION_CHASSIS_ROTATE:
         {
+            s_all_done_command =
+                COMMUNITY_TX_CHASSIS_ALL_DONE;
+
             Move_StartMission(&mission);
 
             return;
@@ -324,6 +333,18 @@ extern "C" void Move_Process(void)
             if (LineTrace_Start(
                     mission.parsed.line_trace_status) != 0U)
             {
+                if (mission.parsed.line_trace_status ==
+                    LINETRACE_STATUS_TO_BUILD)
+                {
+                    s_all_done_command =
+                        COMMUNITY_TX_BUILD_AREA_ARRIVED;
+                }
+                else
+                {
+                    s_all_done_command =
+                        COMMUNITY_TX_CHASSIS_ALL_DONE;
+                }
+
                 s_all_done_reported = 0U;
 
                 Move_StopChassis();
@@ -345,6 +366,8 @@ extern "C" void Move_Process(void)
              * 丢弃本任务，继续 FIFO 中的下一任务。
              */
             s_all_done_reported = 0U;
+            s_all_done_command =
+                COMMUNITY_TX_CHASSIS_ALL_DONE;
 
             Community_SendDebugString(
                 "Unsupported line status\r\n");
@@ -364,6 +387,8 @@ extern "C" void Move_Process(void)
             Move_StopChassis();
 
             s_all_done_reported = 0U;
+            s_all_done_command =
+                COMMUNITY_TX_CHASSIS_ALL_DONE;
 
             Community_SendDebugString(
                 "Stop mission\r\n");
@@ -388,9 +413,12 @@ extern "C" void Move_Process(void)
      */
     if (s_all_done_reported == 0U)
     {
-        Community_SendFinish();
+        Community_SendSimpleFrame(
+            s_all_done_command);
 
         s_all_done_reported = 1U;
+        s_all_done_command =
+            COMMUNITY_TX_CHASSIS_ALL_DONE;
 
         Community_SendDebugString(
             "Move all done\r\n");

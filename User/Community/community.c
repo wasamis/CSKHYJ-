@@ -554,17 +554,30 @@ static void Community_ParseFrame(
     case COMMUNITY_CMD_ARM_GRAB:
     {
         /*
-         * 不入普通队列，直接置位高优先级请求。
-         * 真正动作放在主循环中执行。
+         * 当前调试阶段暂不运行 ArmTask：
+         * 收到完整的 66 66 05 后不启动夹取动作，也不写入请求标志，
+         * 直接按协议回传 66 66 83。Community_SendSimpleFrame()
+         * 会同时发给 USART3(OpenMV) 和 USART1(蓝牙)。
          */
-        s_arm_grab_request = 1U;
+        s_arm_grab_request = 0U;
+
+        // Community_SendSimpleFrame(
+        //     COMMUNITY_TX_ARM_GRAB_DONE);
 
         break;
     }
 
     case COMMUNITY_CMD_ARM_BUILD:
     {
-        s_arm_build_request = 1U;
+        /*
+         * 与夹取命令相同，当前调试阶段旁路真实搭建动作。
+         * 收到完整的 66 66 08 后直接回传搭建完成 66 66 85。
+         */
+        s_arm_build_request = 0U;
+        s_arm_build_active = 0U;
+
+        Community_SendSimpleFrame(
+            COMMUNITY_TX_ARM_BUILD_DONE);
 
         break;
     }

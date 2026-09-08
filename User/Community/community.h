@@ -51,6 +51,8 @@ extern "C" {
  *             1 = 左转
  *             2 = 右转
  *             3 = 终点
+ *      0x01 = 从矿区后退 210 cm 到搭建区
+ *             完成后回传 66 66 84
  */
 
 #define COMMUNITY_FRAME_HEAD_1              0x66U
@@ -67,6 +69,7 @@ extern "C" {
 
 #define COMMUNITY_TX_CHASSIS_ALL_DONE       0x82U
 #define COMMUNITY_TX_ARM_GRAB_DONE          0x83U
+#define COMMUNITY_TX_BUILD_AREA_ARRIVED     0x84U
 #define COMMUNITY_TX_ARM_BUILD_DONE         0x85U
 
 #ifndef COMMUNITY_QUEUE_SIZE

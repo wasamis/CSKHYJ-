@@ -18,7 +18,6 @@
 #include "Move.hpp"
 #include "ArmTask.hpp"
 #include "arm.h"
-#include "community.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -39,8 +38,6 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
-static uint32_t s_finish_test_last_send_ms = 0U;
 
 /* USER CODE END PV */
 
@@ -109,17 +106,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if ((uint32_t)(HAL_GetTick() -
-                   s_finish_test_last_send_ms) >= 500U)
-    {
-      s_finish_test_last_send_ms = HAL_GetTick();
-
-      Community_SendSimpleFrame(
-          COMMUNITY_TX_CHASSIS_ALL_DONE);
-    }
-
     Move_Process();
-    ArmTask_Process();
+    /*
+     * 临时停用机械臂任务状态机。
+     * 当前 0x05 / 0x08 命令由 Community 直接回传 0x83 / 0x85。
+     */
+    /* ArmTask_Process(); */
   }
   /* USER CODE END 3 */
 }

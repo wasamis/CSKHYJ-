@@ -8,9 +8,10 @@ extern "C" {
 #include <stdint.h>
 
 #define LINETRACE_STATUS_INITIAL 0x00U
+#define LINETRACE_STATUS_TO_BUILD 0x01U
 
 /*
- * LineTrace 现在只是 0x00 路线的非阻塞位置环状态机，
+ * LineTrace 是 0x00 / 0x01 路线的非阻塞位置环状态机，
  * 不再读取巡线传感器。
  */
 typedef enum
