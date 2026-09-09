@@ -561,8 +561,8 @@ static void Community_ParseFrame(
          */
         s_arm_grab_request = 0U;
 
-        // Community_SendSimpleFrame(
-        //     COMMUNITY_TX_ARM_GRAB_DONE);
+        Community_SendSimpleFrame(
+            COMMUNITY_TX_ARM_GRAB_DONE);
 
         break;
     }

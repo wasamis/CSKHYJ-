@@ -16,6 +16,10 @@ ORANGE_THRESHOLD = (35, 100, -12, 28, 10, 50)
 ORANGE_REQUIRED = 2
 PURPLE_REQUIRED = 1
 
+# True: skip the orange mission and test only purple recognition/pickup.
+# The complete 0x00 mission described below requires this to be False.
+PURPLE_ONLY_TEST = False
+
 # Desired block position at the instant the 66 66 05 grab command is sent.
 # Coordinates are relative to the camera:
 #   forward > 0: block is in front of the camera
@@ -76,9 +80,13 @@ ANGLE_BACKWARD_DEG = 180
 ANGLE_LEFT_DEG = 270
 
 SEARCH_STEP_CM = 10
-ORANGE_TO_PURPLE_LEFT_CM = 200
-PURPLE_EXIT_LEFT_CM = 20
-PURPLE_EXIT_RIGHT_CM = 70
+ORANGE_TO_PURPLE_LEFT_CM = 100
+PURPLE_WALL_RIGHT_OFFSET_CM = 10
+PURPLE_ENTRY_CLOCKWISE_DEG = 90
+PURPLE_ALIGN_FORWARD_CM = 20
+PURPLE_ALIGN_BACKWARD_CM = 10
+PURPLE_FINAL_BACKWARD_CM = 72
+PURPLE_FINAL_CLOCKWISE_DEG = 90
 
 NO_TARGET_TIMEOUT_MS = 500
 MOVE_SETTLE_MS = 500
@@ -97,6 +105,7 @@ WAIT_BUILD_TIMEOUT_MS = 60000
 UART_BAUDRATE = 115200
 
 CMD_CHASSIS_MOVE = 0x02
+CMD_CHASSIS_ROTATE = 0x03
 CMD_ARM_GRAB = 0x05
 CMD_LINE_TRACE = 0x06
 CMD_ARM_BUILD = 0x08
@@ -108,45 +117,63 @@ MCU_ARM_BUILD_DONE = 0x85
 
 LINE_TRACE_TO_BUILD = 0x01
 
-# True: wait for the initial 0x00 route to finish with 66 66 82.
-# False: start orange-mineral processing immediately for camera-only tests.
-WAIT_MCU_82_BEFORE_CAMERA = True
+# In purple-only test mode the chassis is assumed to have been placed near
+# the purple area manually, so camera processing starts without waiting for
+# the initial 0x00 route completion frame.
+WAIT_MCU_82_BEFORE_CAMERA = not PURPLE_ONLY_TEST
 
 
 # ============================================================
 # Gimbal configuration
 # ============================================================
 
-# Horizontal gimbal servo signal: OpenMV P7.
-SERVO_MIN_US = 1000
-SERVO_MAX_US = 2000
+# Horizontal servo (P7): 270-degree model, 500-2500 us.
+PAN_SERVO_MIN_US = 500
+PAN_SERVO_MAX_US = 2500
+PAN_SERVO_MAX_ANGLE_DEG = 270
+
+# Vertical servo (P8): 270-degree model, 500-2500 us.
+TILT_SERVO_MIN_US = 500
+TILT_SERVO_MAX_US = 2500
+TILT_SERVO_MAX_ANGLE_DEG = 270
 
 # Gimbal position applied immediately when this script starts.
 # Pan  : Servo(1) -> P7
 # Tilt : Servo(2) -> P8
-PAN_INITIAL_ANGLE_DEG = 90
-TILT_INITIAL_ANGLE_DEG = 120
+PAN_INITIAL_ANGLE_DEG = 42
 
-PAN_FORWARD_ANGLE_DEG = 90
+TILT_INITIAL_ANGLE_DEG = 147
+
+PAN_FORWARD_ANGLE_DEG = 135
 
 # Change 180 to 0 if the installed servo turns in the opposite direction.
 PAN_LEFT_ANGLE_DEG = 180
 
-# The QR localization direction can be tuned later.
-PAN_BUILD_QR_ANGLE_DEG = 90
+# Gimbal pose used while travelling to and locating the build-area marker.
+PAN_BUILD_QR_ANGLE_DEG = 225
+TILT_BUILD_QR_ANGLE_DEG = 135
 
 
 # ============================================================
-# Build QR localization configuration
+# Build marker localization configuration
 # ============================================================
 
-# Run openmv_qr_target_calibrate.py once at the exact build pose.  It
-# records the QR centre and apparent size in this file on the OpenMV.
+# Run openmv_qr_target_calibrate.py once at the exact build pose. It records
+# only the white frame centre and apparent size in this file on the OpenMV.
 BUILD_QR_REFERENCE_FILE = "build_qr_target.txt"
 
-# Leave empty to accept the largest visible QR code.  Set this to the exact
-# QR payload later if other QR codes may be visible in the build area.
-BUILD_QR_EXPECTED_PAYLOAD = ""
+# These values must match the standalone calibration program. The internal
+# 8x8 pattern is deliberately ignored; only the continuous white frame is
+# used for localization.
+BUILD_MARKER_WHITE_THRESHOLD = (220, 255)
+BUILD_MARKER_MIN_BLOB_PIXELS = 250
+BUILD_MARKER_MIN_BLOB_AREA = 1600
+BUILD_MARKER_MIN_SIZE_PX = 40
+BUILD_MARKER_MAX_SIZE_PX = 220
+BUILD_MARKER_MAX_SQUARE_ERROR_PERCENT = 22
+BUILD_MARKER_MIN_FRAME_DENSITY_PERCENT = 7
+BUILD_MARKER_MAX_FRAME_DENSITY_PERCENT = 70
+BUILD_MARKER_EDGE_MARGIN_PX = 4
 
 # Physical camera-to-QR distance at the calibrated target pose.  The
 # reference QR width supplies the relative scale for subsequent corrections.
@@ -171,6 +198,7 @@ STATE_BUILD_QR = 5
 STATE_WAIT_BUILD_85 = 6
 STATE_COMPLETE = 7
 STATE_FAULT = 8
+STATE_SEND_ROUTE_01 = 9
 
 COLOR_ORANGE = 0
 COLOR_PURPLE = 1
@@ -179,9 +207,13 @@ AFTER_MOVE_NONE = 0
 AFTER_MOVE_RECHECK_ORANGE = 1
 AFTER_MOVE_RECHECK_PURPLE = 2
 AFTER_MOVE_START_PURPLE = 3
-AFTER_MOVE_PURPLE_EXIT_RIGHT = 4
-AFTER_MOVE_SEND_ROUTE_01 = 5
+AFTER_MOVE_PURPLE_FINAL_BACKWARD_DONE = 4
+AFTER_MOVE_PURPLE_FINAL_TURN_DONE = 5
 AFTER_MOVE_RECHECK_BUILD_QR = 6
+AFTER_MOVE_PURPLE_WALL_REACHED = 7
+AFTER_MOVE_PURPLE_RIGHT_OFFSET_DONE = 8
+AFTER_MOVE_PURPLE_TURN_DONE = 9
+AFTER_MOVE_PURPLE_ALIGN_FORWARD_DONE = 10
 
 
 def clamp(value, low, high):
@@ -214,22 +246,61 @@ def find_largest(blobs):
     return largest
 
 
-def find_largest_build_qr(qr_codes):
-    largest = None
+def build_marker_candidate_is_valid(blob):
+    width = blob.w()
+    height = blob.h()
 
-    for qr_code in qr_codes:
-        if (
-            BUILD_QR_EXPECTED_PAYLOAD
-            and qr_code.payload() != BUILD_QR_EXPECTED_PAYLOAD
-        ):
+    if (
+        width < BUILD_MARKER_MIN_SIZE_PX
+        or height < BUILD_MARKER_MIN_SIZE_PX
+        or width > BUILD_MARKER_MAX_SIZE_PX
+        or height > BUILD_MARKER_MAX_SIZE_PX
+    ):
+        return False
+
+    if (
+        blob.x() <= BUILD_MARKER_EDGE_MARGIN_PX
+        or blob.y() <= BUILD_MARKER_EDGE_MARGIN_PX
+        or (blob.x() + width)
+        >= (FRAME_WIDTH - BUILD_MARKER_EDGE_MARGIN_PX)
+        or (blob.y() + height)
+        >= (FRAME_HEIGHT - BUILD_MARKER_EDGE_MARGIN_PX)
+    ):
+        return False
+
+    longer_side = max(width, height)
+    square_error_percent = abs(width - height) * 100 // longer_side
+
+    if square_error_percent > BUILD_MARKER_MAX_SQUARE_ERROR_PERCENT:
+        return False
+
+    density_percent = blob.pixels() * 100 // (width * height)
+
+    return (
+        density_percent >= BUILD_MARKER_MIN_FRAME_DENSITY_PERCENT
+        and density_percent <= BUILD_MARKER_MAX_FRAME_DENSITY_PERCENT
+    )
+
+
+def find_largest_build_marker(img):
+    blobs = img.find_blobs(
+        [BUILD_MARKER_WHITE_THRESHOLD],
+        pixels_threshold=BUILD_MARKER_MIN_BLOB_PIXELS,
+        area_threshold=BUILD_MARKER_MIN_BLOB_AREA,
+        merge=False
+    )
+    selected = None
+
+    for blob in blobs:
+        if not build_marker_candidate_is_valid(blob):
             continue
 
-        if largest is None:
-            largest = qr_code
-        elif (qr_code.w() * qr_code.h()) > (largest.w() * largest.h()):
-            largest = qr_code
+        if selected is None:
+            selected = blob
+        elif (blob.w() * blob.h()) > (selected.w() * selected.h()):
+            selected = blob
 
-    return largest
+    return selected
 
 
 def load_build_qr_reference():
@@ -248,16 +319,16 @@ def load_build_qr_reference():
         )
 
         if reference[2] < BUILD_QR_MIN_WIDTH_PX or reference[3] <= 0:
-            raise ValueError("invalid QR size")
+            raise ValueError("invalid marker size")
 
         print(
-            "BUILD_QR_REFERENCE_LOADED: cx=%d,cy=%d,w=%d,h=%d"
+            "BUILD_MARKER_REFERENCE_LOADED: cx=%d,cy=%d,w=%d,h=%d"
             % reference
         )
         return reference
     except Exception as error:
         print(
-            "BUILD_QR_REFERENCE_MISSING: run calibration first (%s)"
+            "BUILD_MARKER_REFERENCE_MISSING: run calibration first (%s)"
             % str(error)
         )
         return None
@@ -351,7 +422,6 @@ def estimate_target_pose(cx, width_px):
 def calculate_chassis_move(
     camera_forward_cm,
     camera_right_cm,
-    camera_faces_left,
     target_forward_cm,
     target_right_cm
 ):
@@ -362,15 +432,12 @@ def calculate_chassis_move(
         camera_right_cm - target_right_cm
     )
 
-    if camera_faces_left:
-        # With the camera yawed 90 degrees left:
-        #   camera-forward -> chassis-left
-        #   camera-right   -> chassis-forward
-        move_chassis_forward_cm = move_camera_right_cm
-        move_chassis_right_cm = -move_camera_forward_cm
-    else:
-        move_chassis_forward_cm = move_camera_forward_cm
-        move_chassis_right_cm = move_camera_right_cm
+    # The gimbal keeps the camera facing the same direction as the chassis:
+    #   camera-forward -> chassis-forward
+    #   camera-right   -> chassis-right
+    # Therefore a target on the image's left also maps to chassis-left.
+    move_chassis_forward_cm = move_camera_forward_cm
+    move_chassis_right_cm = move_camera_right_cm
 
     distance_cm = math.sqrt(
         move_chassis_forward_cm * move_chassis_forward_cm
@@ -420,13 +487,35 @@ def build_move_frame(direction_deg, distance_cm):
     return (frame, angle, distance)
 
 
-def angle_to_pulse_us(angle_deg):
-    angle_deg = clamp(angle_deg, 0, 180)
+def build_rotate_frame(clockwise_deg):
+    clockwise = clamp(round_int(clockwise_deg), -180, 180)
+    encoded = clockwise + 180
+
+    frame = bytearray(
+        (
+            0x66,
+            0x66,
+            CMD_CHASSIS_ROTATE,
+            (encoded >> 8) & 0xFF,
+            encoded & 0xFF,
+        )
+    )
+
+    return (frame, clockwise)
+
+
+def angle_to_pulse_us(
+    angle_deg,
+    min_pulse_us,
+    max_pulse_us,
+    max_angle_deg
+):
+    angle_deg = clamp(angle_deg, 0, max_angle_deg)
     pulse_us = (
-        SERVO_MIN_US
-        + (SERVO_MAX_US - SERVO_MIN_US)
+        min_pulse_us
+        + (max_pulse_us - min_pulse_us)
         * angle_deg
-        // 180
+        // max_angle_deg
     )
     return pulse_us
 
@@ -450,14 +539,24 @@ servo_tilt = Servo(2)
 
 def set_pan(angle_deg):
     servo_pan.pulse_width(
-        angle_to_pulse_us(angle_deg)
+        angle_to_pulse_us(
+            angle_deg,
+            PAN_SERVO_MIN_US,
+            PAN_SERVO_MAX_US,
+            PAN_SERVO_MAX_ANGLE_DEG
+        )
     )
     print("PAN_ANGLE: %d" % angle_deg)
 
 
 def set_tilt(angle_deg):
     servo_tilt.pulse_width(
-        angle_to_pulse_us(angle_deg)
+        angle_to_pulse_us(
+            angle_deg,
+            TILT_SERVO_MIN_US,
+            TILT_SERVO_MAX_US,
+            TILT_SERVO_MAX_ANGLE_DEG
+        )
     )
     print("TILT_ANGLE: %d" % angle_deg)
 
@@ -465,6 +564,18 @@ def set_tilt(angle_deg):
 def set_gimbal(pan_angle_deg, tilt_angle_deg):
     set_pan(pan_angle_deg)
     set_tilt(tilt_angle_deg)
+
+
+def prepare_build_marker_camera():
+    # Mineral detection no longer runs after route 0x01, so the camera can be
+    # switched from RGB565 to grayscale for the white-frame detector without
+    # changing the calibrated orange and purple stages.
+    sensor.set_pixformat(sensor.GRAYSCALE)
+    sensor.set_framesize(sensor.QVGA)
+    sensor.set_auto_exposure(True)
+    sensor.set_auto_gain(True)
+    sensor.skip_frames(time=1000)
+    print("BUILD_MARKER_CAMERA_READY: QVGA grayscale")
 
 
 def wait_for_initial_route():
@@ -532,7 +643,10 @@ state = STATE_MINERAL_STABILIZE
 state_started_ms = pyb.millis()
 rx_state = 0
 
-current_color = COLOR_ORANGE
+if PURPLE_ONLY_TEST:
+    current_color = COLOR_PURPLE
+else:
+    current_color = COLOR_ORANGE
 orange_collected = 0
 purple_collected = 0
 
@@ -607,6 +721,25 @@ def send_move(direction_deg, distance_cm, next_action):
     )
 
 
+def send_rotate_clockwise(clockwise_deg, next_action):
+    global after_move_action
+
+    frame, encoded_clockwise = build_rotate_frame(
+        clockwise_deg
+    )
+
+    after_move_action = next_action
+    set_state(STATE_WAIT_CHASSIS_82)
+
+    if not send_uart_frame(frame):
+        return
+
+    print(
+        "ROTATE_COMMAND: clockwise=%d deg"
+        % encoded_clockwise
+    )
+
+
 def send_grab_command():
     set_state(STATE_WAIT_GRAB_83)
     send_uart_frame(
@@ -647,19 +780,47 @@ def dispatch_after_move():
         )
     elif after_move_action == AFTER_MOVE_START_PURPLE:
         current_color = COLOR_PURPLE
-        set_pan(PAN_LEFT_ANGLE_DEG)
         begin_settle(
             STATE_MINERAL_STABILIZE,
             GIMBAL_SETTLE_MS
         )
-    elif after_move_action == AFTER_MOVE_PURPLE_EXIT_RIGHT:
+    elif after_move_action == AFTER_MOVE_PURPLE_WALL_REACHED:
         send_move(
             ANGLE_RIGHT_DEG,
-            PURPLE_EXIT_RIGHT_CM,
-            AFTER_MOVE_SEND_ROUTE_01
+            PURPLE_WALL_RIGHT_OFFSET_CM,
+            AFTER_MOVE_PURPLE_RIGHT_OFFSET_DONE
         )
-    elif after_move_action == AFTER_MOVE_SEND_ROUTE_01:
-        send_route_01_command()
+    elif after_move_action == AFTER_MOVE_PURPLE_RIGHT_OFFSET_DONE:
+        send_rotate_clockwise(
+            PURPLE_ENTRY_CLOCKWISE_DEG,
+            AFTER_MOVE_PURPLE_TURN_DONE
+        )
+    elif after_move_action == AFTER_MOVE_PURPLE_TURN_DONE:
+        send_move(
+            ANGLE_FORWARD_DEG,
+            PURPLE_ALIGN_FORWARD_CM,
+            AFTER_MOVE_PURPLE_ALIGN_FORWARD_DONE
+        )
+    elif after_move_action == AFTER_MOVE_PURPLE_ALIGN_FORWARD_DONE:
+        send_move(
+            ANGLE_BACKWARD_DEG,
+            PURPLE_ALIGN_BACKWARD_CM,
+            AFTER_MOVE_START_PURPLE
+        )
+    elif after_move_action == AFTER_MOVE_PURPLE_FINAL_BACKWARD_DONE:
+        send_rotate_clockwise(
+            PURPLE_FINAL_CLOCKWISE_DEG,
+            AFTER_MOVE_PURPLE_FINAL_TURN_DONE
+        )
+    elif after_move_action == AFTER_MOVE_PURPLE_FINAL_TURN_DONE:
+        set_gimbal(
+            PAN_BUILD_QR_ANGLE_DEG,
+            TILT_BUILD_QR_ANGLE_DEG
+        )
+        begin_settle(
+            STATE_SEND_ROUTE_01,
+            GIMBAL_SETTLE_MS
+        )
     elif after_move_action == AFTER_MOVE_RECHECK_BUILD_QR:
         begin_settle(
             STATE_BUILD_QR,
@@ -693,7 +854,7 @@ def handle_grab_done():
             send_move(
                 ANGLE_LEFT_DEG,
                 ORANGE_TO_PURPLE_LEFT_CM,
-                AFTER_MOVE_START_PURPLE
+                AFTER_MOVE_PURPLE_WALL_REACHED
             )
     else:
         purple_collected += 1
@@ -702,11 +863,23 @@ def handle_grab_done():
             % (purple_collected, PURPLE_REQUIRED)
         )
 
-        send_move(
-            ANGLE_LEFT_DEG,
-            PURPLE_EXIT_LEFT_CM,
-            AFTER_MOVE_PURPLE_EXIT_RIGHT
-        )
+        if PURPLE_ONLY_TEST:
+            print("PURPLE_ONLY_TEST_COMPLETE")
+            set_state(STATE_COMPLETE)
+            return
+
+        if purple_collected < PURPLE_REQUIRED:
+            send_move(
+                ANGLE_LEFT_DEG,
+                SEARCH_STEP_CM,
+                AFTER_MOVE_RECHECK_PURPLE
+            )
+        else:
+            send_move(
+                ANGLE_BACKWARD_DEG,
+                PURPLE_FINAL_BACKWARD_CM,
+                AFTER_MOVE_PURPLE_FINAL_BACKWARD_DONE
+            )
 
 
 def handle_mcu_message(message_type):
@@ -725,7 +898,7 @@ def handle_mcu_message(message_type):
     elif message_type == MCU_BUILD_AREA_ARRIVED:
         if state == STATE_WAIT_ROUTE_01_84:
             print("BUILD_AREA_ARRIVED: 66 66 84")
-            set_pan(PAN_BUILD_QR_ANGLE_DEG)
+            prepare_build_marker_camera()
             begin_settle(
                 STATE_BUILD_QR,
                 GIMBAL_SETTLE_MS
@@ -801,7 +974,6 @@ def search_if_timed_out(
 def process_mineral_target(
     label,
     selected,
-    camera_faces_left,
     target_forward_cm,
     target_right_cm,
     search_direction_deg,
@@ -887,7 +1059,6 @@ def process_mineral_target(
     move = calculate_chassis_move(
         camera_forward_cm,
         camera_right_cm,
-        camera_faces_left,
         target_forward_cm,
         target_right_cm
     )
@@ -942,7 +1113,6 @@ def decide_orange_mining(orange_blob, should_print):
     process_mineral_target(
         "ORANGE",
         orange_blob,
-        False,
         ORANGE_GRAB_TARGET_FORWARD_CM,
         ORANGE_GRAB_TARGET_RIGHT_CM,
         ANGLE_LEFT_DEG,
@@ -959,59 +1129,58 @@ def decide_purple_mining(purple_blob, should_print):
     process_mineral_target(
         "PURPLE",
         purple_blob,
-        True,
         PURPLE_GRAB_TARGET_FORWARD_CM,
         PURPLE_GRAB_TARGET_RIGHT_CM,
-        ANGLE_BACKWARD_DEG,
+        ANGLE_LEFT_DEG,
         AFTER_MOVE_RECHECK_PURPLE,
-        "backward",
+        "left",
         should_print
     )
 
 
-def process_build_qr(img, should_print):
+def process_build_marker(img, should_print):
     if build_qr_reference is None:
         if should_print:
             print(
-                "BUILD_QR_DISABLED: missing %s"
+                "BUILD_MARKER_DISABLED: missing %s"
                 % BUILD_QR_REFERENCE_FILE
             )
         return
 
-    qr_code = find_largest_build_qr(img.find_qrcodes())
+    marker = find_largest_build_marker(img)
 
-    if qr_code is None:
+    if marker is None:
         target_filter.clear()
 
         if should_print:
-            print("BUILD_QR_NOT_FOUND")
+            print("BUILD_MARKER_NOT_FOUND")
         return
 
     img.draw_rectangle(
-        qr_code.rect(),
-        color=(0, 255, 0),
+        marker.rect(),
+        color=255,
         thickness=2
     )
     img.draw_cross(
-        qr_code.cx(),
-        qr_code.cy(),
-        color=(255, 0, 0)
+        marker.cx(),
+        marker.cy(),
+        color=127
     )
 
-    if not blob_is_complete(qr_code):
+    if not blob_is_complete(marker):
         target_filter.clear()
 
         if should_print:
-            print("BUILD_QR_INCOMPLETE")
+            print("BUILD_MARKER_INCOMPLETE")
         return
 
-    target_filter.add("BUILD_QR", qr_code)
+    target_filter.add("BUILD_MARKER", marker)
     stable = target_filter.result()
 
     if stable is None:
         if should_print:
             print(
-                "BUILD_QR_STABILIZING: %d/%d"
+                "BUILD_MARKER_STABILIZING: %d/%d"
                 % (len(target_filter.samples), FILTER_WINDOW)
             )
         return
@@ -1025,7 +1194,7 @@ def process_build_qr(img, should_print):
         target_filter.clear()
 
         if should_print:
-            print("BUILD_QR_TOO_SMALL")
+            print("BUILD_MARKER_TOO_SMALL")
         return
 
     target_cx = build_qr_reference[0]
@@ -1074,12 +1243,11 @@ def process_build_qr(img, should_print):
 
     if should_print:
         print(
-            "BUILD_QR,payload=%s,cx=%d,cy=%d,w=%d,h=%d,"
+            "BUILD_MARKER,cx=%d,cy=%d,w=%d,h=%d,"
             "target_cx=%d,target_cy=%d,target_w=%d,target_h=%d,"
             "Z=%.2fcm,camera_df=%.2fcm,camera_dr=%.2fcm,"
             "chassis_dir=%.1fdeg,chassis_dist=%.2fcm"
             % (
-                qr_code.payload(),
                 cx,
                 cy,
                 width,
@@ -1102,7 +1270,7 @@ def process_build_qr(img, should_print):
         and abs(move_camera_right_cm)
         <= BUILD_QR_RIGHT_TOLERANCE_CM
     ):
-        print("BUILD_QR_ALIGNED: send build command")
+        print("BUILD_MARKER_ALIGNED: send build command")
         send_build_command()
         return
 
@@ -1113,10 +1281,13 @@ def process_build_qr(img, should_print):
     )
 
 
-print(
-    "MISSION_0x00: collect %d orange and %d purple"
-    % (ORANGE_REQUIRED, PURPLE_REQUIRED)
-)
+if PURPLE_ONLY_TEST:
+    print("PURPLE_ONLY_TEST: orange mission disabled")
+else:
+    print(
+        "MISSION_0x00: collect %d orange and %d purple"
+        % (ORANGE_REQUIRED, PURPLE_REQUIRED)
+    )
 
 
 while True:
@@ -1144,6 +1315,8 @@ while True:
     elif state == STATE_SETTLE:
         if elapsed_ms >= settle_duration_ms:
             set_state(settle_next_state)
+    elif state == STATE_SEND_ROUTE_01:
+        send_route_01_command()
 
     img = sensor.snapshot()
 
@@ -1207,7 +1380,7 @@ while True:
                 should_print
             )
     elif state == STATE_BUILD_QR:
-        process_build_qr(
+        process_build_marker(
             img,
             should_print
         )

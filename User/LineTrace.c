@@ -22,8 +22,8 @@ typedef struct
 
 static const LineTrace_Step_t s_initial_steps[] =
 {
-    {LINETRACE_COMMAND_MOVE_CM,       0U,  90U,   0},
-    {LINETRACE_COMMAND_ROTATE_DEG,    0U,   0U,  90},
+ //   {LINETRACE_COMMAND_MOVE_CM,       0U,  90U,   0},
+ //   {LINETRACE_COMMAND_ROTATE_DEG,    0U,   0U,  90},
     {LINETRACE_COMMAND_MOVE_CM,       0U, 240U,   0},
     {LINETRACE_COMMAND_ROTATE_DEG,    0U,   0U, -90},
     {LINETRACE_COMMAND_MOVE_CM,       0U, 208U,   0},
