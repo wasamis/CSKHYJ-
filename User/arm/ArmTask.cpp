@@ -1,5 +1,4 @@
 #include "ArmTask.hpp"
-
 #include "arm.h"
 #include "community.h"
 
@@ -20,8 +19,6 @@
  *
  *   0x07 -> Community_IsStopRequested()
  *          -> Arm_Stop()
- *
- * The old 0x01 wrist-parameter command is no longer used here.
  *
  * ArmTask does not directly control chassis motors.
  */
@@ -120,6 +117,9 @@ extern "C" void ArmTask_Process(void)
      * ========================================================
      * 3. Build request: Community command 0x0B
      * ========================================================
+     *
+     * 丝杆搭建任务，与抓取互斥。
+     * 如果不需要丝杆功能，可以注释掉整个 if 块。
      */
     if (Community_TakeArmBuildRequest() != 0U)
     {
@@ -152,9 +152,6 @@ extern "C" void ArmTask_Process(void)
      * ========================================================
      * 5. Build just finished
      * ========================================================
-     *
-     * Current Community provides no dedicated build-finish frame,
-     * so keep using Community_SendFinish() here.
      */
     if (Arm_TakeBuildFinished() != 0U)
     {
@@ -179,11 +176,6 @@ extern "C" void ArmTask_Process(void)
      * ========================================================
      * 7. Grab just finished
      * ========================================================
-     *
-     * Current Community behavior:
-     *
-     *   Community_SendArmFinish() -> arm-specific finish frame
-     *   Community_SendFinish()    -> general all-done frame
      */
     if (Arm_TakeFinished() != 0U)
     {
