@@ -53,6 +53,10 @@ static uint8_t s_queue_count = 0U;
 
 static volatile uint8_t s_stop_request = 0U;
 
+/* 连续视觉帧只保留最新值，不进入普通任务队列。 */
+static volatile Community_VisionTarget_t s_vision_target;
+static volatile uint8_t s_vision_target_pending = 0U;
+
 /*
  * 机械臂命令不进入普通任务队列。
  * 这样命令到达后，Move_Process() 下一次循环即可立即处理，
@@ -83,6 +87,8 @@ static void Community_ParseFrame(uint8_t cmd,
                                  uint8_t len);
 
 static uint16_t Community_ReadUInt16BE(const uint8_t *p);
+static int16_t Community_ReadInt16BE(const uint8_t *p);
+static void Community_StoreVisionStop(void);
 
 /*
  * ============================================================
@@ -100,6 +106,7 @@ void Community_Init(void)
     Community_ClearQueue();
 
     s_stop_request = 0U;
+    Community_ClearVisionTarget();
 
     s_arm_grab_request = 0U;
     s_arm_build_request = 0U;
@@ -339,6 +346,65 @@ void Community_ClearStopRequest(void)
     s_stop_request = 0U;
 }
 
+uint8_t Community_TakeVisionTarget(
+    Community_VisionTarget_t *target)
+{
+    uint8_t available;
+    uint32_t primask;
+
+    if (target == NULL)
+    {
+        return 0U;
+    }
+
+    /* 数据由串口中断更新，短暂关中断以取得同一帧的完整快照。 */
+    primask = __get_PRIMASK();
+    __disable_irq();
+
+    available = s_vision_target_pending;
+
+    if (available != 0U)
+    {
+        target->sequence = s_vision_target.sequence;
+        target->flags = s_vision_target.flags;
+        target->forward_error_mm =
+            s_vision_target.forward_error_mm;
+        target->right_error_mm =
+            s_vision_target.right_error_mm;
+        target->received_tick_ms =
+            s_vision_target.received_tick_ms;
+
+        s_vision_target_pending = 0U;
+    }
+
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    return available;
+}
+
+void Community_ClearVisionTarget(void)
+{
+    uint32_t primask;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+
+    s_vision_target.sequence = 0U;
+    s_vision_target.flags = 0U;
+    s_vision_target.forward_error_mm = 0;
+    s_vision_target.right_error_mm = 0;
+    s_vision_target.received_tick_ms = 0U;
+    s_vision_target_pending = 0U;
+
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
 uint8_t Community_TakeArmGrabRequest(void)
 {
     uint8_t request;
@@ -460,6 +526,9 @@ static uint8_t Community_GetPayloadLength(uint8_t cmd)
     case COMMUNITY_CMD_ARM_BUILD:
         return 0U;
 
+    case COMMUNITY_CMD_VISION_TARGET:
+        return 6U;
+
     case COMMUNITY_CMD_OPENLOOP_TEST:
         return 0U;
 
@@ -560,9 +629,10 @@ static void Community_ParseFrame(
          * 会同时发给 USART3(OpenMV) 和 USART1(蓝牙)。
          */
         s_arm_grab_request = 0U;
+        Community_StoreVisionStop();
 
-        Community_SendSimpleFrame(
-            COMMUNITY_TX_ARM_GRAB_DONE);
+        // Community_SendSimpleFrame(
+        //     COMMUNITY_TX_ARM_GRAB_DONE);
 
         break;
     }
@@ -575,9 +645,30 @@ static void Community_ParseFrame(
          */
         s_arm_build_request = 0U;
         s_arm_build_active = 0U;
+        Community_StoreVisionStop();
 
         Community_SendSimpleFrame(
             COMMUNITY_TX_ARM_BUILD_DONE);
+
+        break;
+    }
+
+    case COMMUNITY_CMD_VISION_TARGET:
+    {
+        if (len < 6U)
+        {
+            return;
+        }
+
+        /* ISR 中只覆盖最新测量值；PID 留在 Move_Process() 中运行。 */
+        s_vision_target.sequence = payload[0];
+        s_vision_target.flags = payload[1];
+        s_vision_target.forward_error_mm =
+            Community_ReadInt16BE(&payload[2]);
+        s_vision_target.right_error_mm =
+            Community_ReadInt16BE(&payload[4]);
+        s_vision_target.received_tick_ms = HAL_GetTick();
+        s_vision_target_pending = 1U;
 
         break;
     }
@@ -589,6 +680,7 @@ static void Community_ParseFrame(
         s_arm_build_request = 0U;
         s_arm_build_active = 0U;
         s_suppress_next_general_finish = 0U;
+        Community_ClearVisionTarget();
 
         Community_ClearQueue();
 
@@ -631,4 +723,19 @@ static uint16_t Community_ReadUInt16BE(
         ((uint16_t)p[1]);
 
     return value;
+}
+
+static int16_t Community_ReadInt16BE(
+    const uint8_t *p)
+{
+    return (int16_t)Community_ReadUInt16BE(p);
+}
+
+static void Community_StoreVisionStop(void)
+{
+    s_vision_target.flags = 0U;
+    s_vision_target.forward_error_mm = 0;
+    s_vision_target.right_error_mm = 0;
+    s_vision_target.received_tick_ms = HAL_GetTick();
+    s_vision_target_pending = 1U;
 }

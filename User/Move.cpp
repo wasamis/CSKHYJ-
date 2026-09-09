@@ -82,6 +82,28 @@
 #define MOVE_ROTATE_SIGN                 1.0f
 
 /*
+ * OpenMV visual outer-loop tuning. Errors arrive in millimetres and the
+ * output is chassis velocity in m/s. Start with P-only control; Ki/Kd remain
+ * available as macros after the direction and Kp values are verified.
+ */
+#define MOVE_VISION_FORWARD_KP                   1.00f
+#define MOVE_VISION_FORWARD_KI                   0.00f
+#define MOVE_VISION_FORWARD_KD                   0.00f
+#define MOVE_VISION_RIGHT_KP                     1.00f
+#define MOVE_VISION_RIGHT_KI                     0.00f
+#define MOVE_VISION_RIGHT_KD                     0.00f
+#define MOVE_VISION_FORWARD_SIGN                 1.00f
+#define MOVE_VISION_RIGHT_SIGN                   -1.00f
+#define MOVE_VISION_MAX_SPEED_M_S                0.18f
+#define MOVE_VISION_MIN_SPEED_M_S                0.04f
+#define MOVE_VISION_ERROR_DEADBAND_M             0.015f
+#define MOVE_VISION_INTEGRAL_LIMIT               0.20f
+#define MOVE_VISION_FRAME_TIMEOUT_MS             250U
+#define MOVE_VISION_DEFAULT_DT_S                 0.05f
+#define MOVE_VISION_MIN_DT_S                     0.01f
+#define MOVE_VISION_MAX_DT_S                     0.20f
+
+/*
  * ============================================================
  * Internal state
  * ============================================================
@@ -116,6 +138,19 @@ static uint8_t s_all_done_reported = 1U;
 static uint8_t s_all_done_command =
     COMMUNITY_TX_CHASSIS_ALL_DONE;
 
+typedef struct
+{
+    float integral;
+    float previous_error;
+    uint8_t has_previous;
+
+} Move_VisionPidState_t;
+
+static Move_VisionPidState_t s_vision_forward_pid;
+static Move_VisionPidState_t s_vision_right_pid;
+static uint8_t s_vision_active = 0U;
+static uint32_t s_vision_last_rx_tick_ms = 0U;
+
 /*
  * ============================================================
  * Internal declarations
@@ -133,6 +168,21 @@ static void Move_StartRotate(
     int16_t rotate_deg);
 
 static void Move_StopChassis(void);
+
+static void Move_ProcessVisionTarget(
+    const Community_VisionTarget_t *target);
+
+static void Move_StopVisionControl(void);
+
+static void Move_ResetVisionPid(void);
+
+static float Move_VisionPidStep(
+    Move_VisionPidState_t *pid,
+    float error_m,
+    float dt_s,
+    float kp,
+    float ki,
+    float kd);
 
 static void Move_ProcessLineTrace(
     uint8_t movement_finished_event);
@@ -179,6 +229,10 @@ extern "C" void Move_Init(void)
     s_finish_stable_count = 0U;
     s_task_finished_pending = 0U;
 
+    s_vision_active = 0U;
+    s_vision_last_rx_tick_ms = 0U;
+    Move_ResetVisionPid();
+
     s_all_done_reported = 1U;
     s_all_done_command =
         COMMUNITY_TX_CHASSIS_ALL_DONE;
@@ -199,6 +253,7 @@ extern "C" void Move_Init(void)
 extern "C" void Move_Process(void)
 {
     uint8_t movement_finished_event = 0U;
+    Community_VisionTarget_t vision_target;
 
     /*
      * ========================================================
@@ -210,6 +265,8 @@ extern "C" void Move_Process(void)
         s_move_active = 0U;
         s_finish_stable_count = 0U;
         s_task_finished_pending = 0U;
+        s_vision_active = 0U;
+        Move_ResetVisionPid();
 
         /*
          * 同时终止巡线状态机。
@@ -217,6 +274,7 @@ extern "C" void Move_Process(void)
         LineTrace_Stop();
 
         Community_ClearQueue();
+        Community_ClearVisionTarget();
         Community_ClearStopRequest();
 
         Move_StopChassis();
@@ -233,6 +291,33 @@ extern "C" void Move_Process(void)
             "Move STOP\r\n");
 
         return;
+    }
+
+    /*
+     * Vision frames form a latest-value mailbox, not a queued mission.
+     * An invalid frame stops velocity control immediately; a valid frame may
+     * take control only while no finite movement or route owns the chassis.
+     */
+    if (Community_TakeVisionTarget(&vision_target) != 0U)
+    {
+        Move_ProcessVisionTarget(&vision_target);
+    }
+
+    if (s_vision_active != 0U)
+    {
+        if ((uint32_t)(HAL_GetTick() -
+                       s_vision_last_rx_tick_ms) >
+            MOVE_VISION_FRAME_TIMEOUT_MS)
+        {
+            Move_StopVisionControl();
+            Community_SendDebugString(
+                "Vision timeout\r\n");
+        }
+        else
+        {
+            /* Continuous visual velocity owns the chassis for this cycle. */
+            return;
+        }
     }
 
     /*
@@ -767,6 +852,184 @@ static void Move_ProcessLineTrace(
         break;
     }
     }
+}
+
+/*
+ * ============================================================
+ * Continuous visual PID
+ * ============================================================
+ */
+
+static void Move_ResetVisionPid(void)
+{
+    s_vision_forward_pid.integral = 0.0f;
+    s_vision_forward_pid.previous_error = 0.0f;
+    s_vision_forward_pid.has_previous = 0U;
+
+    s_vision_right_pid.integral = 0.0f;
+    s_vision_right_pid.previous_error = 0.0f;
+    s_vision_right_pid.has_previous = 0U;
+}
+
+static float Move_VisionPidStep(
+    Move_VisionPidState_t *pid,
+    float error_m,
+    float dt_s,
+    float kp,
+    float ki,
+    float kd)
+{
+    float derivative = 0.0f;
+    float output;
+
+    if (Move_AbsF(error_m) <=
+        MOVE_VISION_ERROR_DEADBAND_M)
+    {
+        pid->integral = 0.0f;
+        pid->previous_error = error_m;
+        pid->has_previous = 1U;
+        return 0.0f;
+    }
+
+    pid->integral += error_m * dt_s;
+
+    if (pid->integral > MOVE_VISION_INTEGRAL_LIMIT)
+    {
+        pid->integral = MOVE_VISION_INTEGRAL_LIMIT;
+    }
+    else if (pid->integral < -MOVE_VISION_INTEGRAL_LIMIT)
+    {
+        pid->integral = -MOVE_VISION_INTEGRAL_LIMIT;
+    }
+
+    if ((pid->has_previous != 0U) &&
+        (dt_s > 0.0f))
+    {
+        derivative =
+            (error_m - pid->previous_error) / dt_s;
+    }
+
+    pid->previous_error = error_m;
+    pid->has_previous = 1U;
+
+    output =
+        kp * error_m +
+        ki * pid->integral +
+        kd * derivative;
+
+    if (output > MOVE_VISION_MAX_SPEED_M_S)
+    {
+        output = MOVE_VISION_MAX_SPEED_M_S;
+    }
+    else if (output < -MOVE_VISION_MAX_SPEED_M_S)
+    {
+        output = -MOVE_VISION_MAX_SPEED_M_S;
+    }
+
+    if ((output > 0.0f) &&
+        (output < MOVE_VISION_MIN_SPEED_M_S))
+    {
+        output = MOVE_VISION_MIN_SPEED_M_S;
+    }
+    else if ((output < 0.0f) &&
+             (output > -MOVE_VISION_MIN_SPEED_M_S))
+    {
+        output = -MOVE_VISION_MIN_SPEED_M_S;
+    }
+
+    return output;
+}
+
+static void Move_ProcessVisionTarget(
+    const Community_VisionTarget_t *target)
+{
+    float dt_s = MOVE_VISION_DEFAULT_DT_S;
+    SpeedTypeDef velocity;
+
+    if (target == NULL)
+    {
+        return;
+    }
+
+    if ((target->flags &
+         COMMUNITY_VISION_FLAG_VALID) == 0U)
+    {
+        Move_StopVisionControl();
+        return;
+    }
+
+    /* Finite movement and route state machines keep priority. */
+    if ((s_move_active != 0U) ||
+        (LineTrace_IsActive() != 0U) ||
+        (Community_GetQueueCount() != 0U))
+    {
+        return;
+    }
+
+    if (s_vision_active == 0U)
+    {
+        Move_ResetVisionPid();
+    }
+    else
+    {
+        const uint32_t dt_ms =
+            (uint32_t)(target->received_tick_ms -
+                       s_vision_last_rx_tick_ms);
+
+        dt_s = (float)dt_ms * 0.001f;
+
+        if (dt_s < MOVE_VISION_MIN_DT_S)
+        {
+            dt_s = MOVE_VISION_MIN_DT_S;
+        }
+        else if (dt_s > MOVE_VISION_MAX_DT_S)
+        {
+            dt_s = MOVE_VISION_MAX_DT_S;
+        }
+    }
+
+    velocity.Y =
+        MOVE_VISION_FORWARD_SIGN *
+        Move_VisionPidStep(
+            &s_vision_forward_pid,
+            (float)target->forward_error_mm * 0.001f,
+            dt_s,
+            MOVE_VISION_FORWARD_KP,
+            MOVE_VISION_FORWARD_KI,
+            MOVE_VISION_FORWARD_KD);
+
+    velocity.X =
+        MOVE_VISION_RIGHT_SIGN *
+        Move_VisionPidStep(
+            &s_vision_right_pid,
+            (float)target->right_error_mm * 0.001f,
+            dt_s,
+            MOVE_VISION_RIGHT_KP,
+            MOVE_VISION_RIGHT_KI,
+            MOVE_VISION_RIGHT_KD);
+
+    velocity.Omega = 0.0f;
+
+    Move_Chassis.Set_Control_Method(
+        Control_Method_OMEGA);
+    Move_Chassis.Set_Velocity(velocity);
+
+    s_vision_last_rx_tick_ms =
+        target->received_tick_ms;
+    s_vision_active = 1U;
+}
+
+static void Move_StopVisionControl(void)
+{
+    if (s_vision_active == 0U)
+    {
+        return;
+    }
+
+    s_vision_active = 0U;
+    s_vision_last_rx_tick_ms = 0U;
+    Move_ResetVisionPid();
+    Move_StopChassis();
 }
 
 /*

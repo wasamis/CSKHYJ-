@@ -37,6 +37,13 @@ extern "C" {
  * 0x08 立即发起搭建任务
  *      无 payload
  *
+ * 0x09 连续视觉目标（仅更新最新值，不进入任务队列）
+ *      payload:
+ *      sequence          uint8_t
+ *      flags             uint8_t, bit0=目标有效
+ *      forward_error_mm  int16_t, big-endian
+ *      right_error_mm    int16_t, big-endian
+ *
  * 0x55 开环测试
  *      无 payload
  *
@@ -64,8 +71,10 @@ extern "C" {
 #define COMMUNITY_CMD_LINE_TRACE            0x06U
 #define COMMUNITY_CMD_STOP_ALL              0x07U
 #define COMMUNITY_CMD_ARM_BUILD             0x08U
+#define COMMUNITY_CMD_VISION_TARGET         0x09U
 #define COMMUNITY_CMD_OPENLOOP_TEST         0x55U
 
+#define COMMUNITY_VISION_FLAG_VALID         0x01U
 
 #define COMMUNITY_TX_CHASSIS_ALL_DONE       0x82U
 #define COMMUNITY_TX_ARM_GRAB_DONE          0x83U
@@ -97,6 +106,16 @@ typedef struct
 
 typedef struct
 {
+    uint8_t sequence;
+    uint8_t flags;
+    int16_t forward_error_mm;
+    int16_t right_error_mm;
+    uint32_t received_tick_ms;
+
+} Community_VisionTarget_t;
+
+typedef struct
+{
     Community_MissionType_t type;
 
     union
@@ -123,6 +142,10 @@ uint8_t Community_GetQueueCount(void);
 
 uint8_t Community_IsStopRequested(void);
 void Community_ClearStopRequest(void);
+
+uint8_t Community_TakeVisionTarget(
+    Community_VisionTarget_t *target);
+void Community_ClearVisionTarget(void);
 
 /*
  * 非底盘模块若仍使用机械臂请求，可通过以下接口读取。

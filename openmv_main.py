@@ -11,7 +11,11 @@ from pyb import Servo, UART
 
 # LAB thresholds for normal indoor lighting.
 PURPLE_THRESHOLD = (25, 85, 4, 32, -45, -8)
-ORANGE_THRESHOLD = (35, 100, -12, 28, 10, 50)
+
+# White surfaces under warm light can have a small positive B value.  Require
+# both positive A and a stronger positive B, and exclude the brightest neutral
+# area so that the white field is not accepted as an orange mineral.
+ORANGE_THRESHOLD = (35, 92, 4, 32, 18, 50)
 
 ORANGE_REQUIRED = 2
 PURPLE_REQUIRED = 1
@@ -35,10 +39,19 @@ ORANGE_GRAB_TARGET_RIGHT_CM = -11.0
 PURPLE_GRAB_TARGET_FORWARD_CM = 38.0
 PURPLE_GRAB_TARGET_RIGHT_CM = -12.0
 
-# Distance calibration:
-# (width_px, distance_cm) = (120,30), (92,40), (74,50), (63,60), (54,70)
+# Distance calibration. For one square block width and height are close, so
+# the existing fit is used initially with blob height. Recalibrate A/B with
+# measured block heights later if the forward distance has a fixed error.
+# (side_px, distance_cm) = (120,30), (92,40), (74,50), (63,60), (54,70)
 DISTANCE_A = 3940.04622
 DISTANCE_B = -2.881682
+
+# Each mineral is a 10 cm square. Several touching blocks form one long blob;
+# its height still represents one block side. This ratio compensates camera
+# perspective or threshold shrinkage when converting height to pixel width.
+BLOCK_SIDE_CM = 10.0
+BLOCK_WIDTH_FROM_HEIGHT_RATIO = 1.0
+MINERAL_MIN_HEIGHT_PX = 18
 
 # Horizontal calibration at approximately 50 cm.
 CX_ZERO = 157.714286
@@ -51,10 +64,12 @@ MIN_VALID_FORWARD_CM = 10.0
 MAX_VALID_FORWARD_CM = 75.0
 
 FILTER_WINDOW = 3
-MAX_CX_RANGE_PX = 6
-MAX_CY_RANGE_PX = 6
-MAX_W_RANGE_PX = 5
-MAX_H_RANGE_PX = 6
+TRACKING_FILTER_MIN_SAMPLES = 1
+ALIGNMENT_CONFIRM_FRAMES = 3
+
+# Keep the last valid PID command through very short threshold flicker.  If
+# the target remains missing, stop the chassis before starting a search move.
+VISION_TARGET_LOST_STOP_MS = 150
 
 EDGE_MARGIN_PX = 2
 MIN_VISIBLE_ASPECT_RATIO = 0.60
@@ -86,7 +101,8 @@ PURPLE_ENTRY_CLOCKWISE_DEG = 90
 PURPLE_ALIGN_FORWARD_CM = 20
 PURPLE_ALIGN_BACKWARD_CM = 10
 PURPLE_FINAL_BACKWARD_CM = 72
-PURPLE_FINAL_CLOCKWISE_DEG = 90
+# Negative means counterclockwise in the 0x03 protocol.
+PURPLE_FINAL_ROTATION_DEG = -90
 
 NO_TARGET_TIMEOUT_MS = 500
 MOVE_SETTLE_MS = 500
@@ -109,6 +125,10 @@ CMD_CHASSIS_ROTATE = 0x03
 CMD_ARM_GRAB = 0x05
 CMD_LINE_TRACE = 0x06
 CMD_ARM_BUILD = 0x08
+CMD_VISION_TARGET = 0x09
+
+VISION_FLAG_VALID = 0x01
+VISION_TX_INTERVAL_MS = 50
 
 MCU_CHASSIS_DONE = 0x82
 MCU_ARM_GRAB_DONE = 0x83
@@ -144,12 +164,7 @@ PAN_INITIAL_ANGLE_DEG = 42
 
 TILT_INITIAL_ANGLE_DEG = 147
 
-PAN_FORWARD_ANGLE_DEG = 135
-
-# Change 180 to 0 if the installed servo turns in the opposite direction.
-PAN_LEFT_ANGLE_DEG = 180
-
-# Gimbal pose used while travelling to and locating the build-area marker.
+# Gimbal pose used only while locating the build-area marker.
 PAN_BUILD_QR_ANGLE_DEG = 225
 TILT_BUILD_QR_ANGLE_DEG = 135
 
@@ -236,14 +251,64 @@ def median(values):
     return ordered[len(ordered) // 2]
 
 
-def find_largest(blobs):
-    largest = None
+def find_rightmost_mineral(blobs):
+    selected = None
 
     for blob in blobs:
-        if largest is None or blob.pixels() > largest.pixels():
-            largest = blob
+        if blob.h() < MINERAL_MIN_HEIGHT_PX:
+            continue
 
-    return largest
+        if selected is None:
+            selected = blob
+            continue
+
+        blob_right = blob.x() + blob.w()
+        selected_right = selected.x() + selected.w()
+
+        if blob_right > selected_right:
+            selected = blob
+        elif (
+            blob_right == selected_right
+            and blob.pixels() > selected.pixels()
+        ):
+            selected = blob
+
+    return selected
+
+
+def mineral_height_is_complete(blob):
+    if blob is None or blob.h() < MINERAL_MIN_HEIGHT_PX:
+        return False
+
+    # Horizontal clipping is allowed: the controller keeps moving until the
+    # right end of a long row enters the image. Vertical clipping would make
+    # the one-block height and therefore distance estimate invalid.
+    return (
+        blob.y() > EDGE_MARGIN_PX
+        and (blob.y() + blob.h())
+        < (FRAME_HEIGHT - EDGE_MARGIN_PX)
+    )
+
+
+def rightmost_block_measurement(blob):
+    single_block_width_px = max(
+        1,
+        round_int(
+            blob.h() * BLOCK_WIDTH_FROM_HEIGHT_RATIO
+        )
+    )
+    right_edge_x = blob.x() + blob.w()
+    rightmost_cx = round_int(
+        right_edge_x - single_block_width_px * 0.5
+    )
+
+    return (
+        rightmost_cx,
+        blob.cy(),
+        single_block_width_px,
+        blob.h(),
+        right_edge_x < (FRAME_WIDTH - EDGE_MARGIN_PX),
+    )
 
 
 def build_marker_candidate_is_valid(blob):
@@ -357,7 +422,7 @@ def blob_is_complete(blob):
     )
 
 
-class StableTarget:
+class TargetFilter:
     def __init__(self):
         self.label = None
         self.samples = []
@@ -367,34 +432,34 @@ class StableTarget:
         self.samples = []
 
     def add(self, label, blob):
+        self.add_values(
+            label,
+            blob.cx(),
+            blob.cy(),
+            blob.w(),
+            blob.h()
+        )
+
+    def add_values(self, label, cx, cy, width, height):
         if self.label != label:
             self.clear()
             self.label = label
 
         self.samples.append(
-            (blob.cx(), blob.cy(), blob.w(), blob.h())
+            (cx, cy, width, height)
         )
 
         if len(self.samples) > FILTER_WINDOW:
             self.samples.pop(0)
 
-    def result(self):
-        if len(self.samples) < FILTER_WINDOW:
+    def filtered_result(self, min_samples=1):
+        if len(self.samples) < min_samples:
             return None
 
         cxs = [sample[0] for sample in self.samples]
         cys = [sample[1] for sample in self.samples]
         widths = [sample[2] for sample in self.samples]
         heights = [sample[3] for sample in self.samples]
-
-        if (max(cxs) - min(cxs)) > MAX_CX_RANGE_PX:
-            return None
-        if (max(cys) - min(cys)) > MAX_CY_RANGE_PX:
-            return None
-        if (max(widths) - min(widths)) > MAX_W_RANGE_PX:
-            return None
-        if (max(heights) - min(heights)) > MAX_H_RANGE_PX:
-            return None
 
         return (
             self.label,
@@ -566,6 +631,13 @@ def set_gimbal(pan_angle_deg, tilt_angle_deg):
     set_tilt(tilt_angle_deg)
 
 
+def set_mineral_gimbal():
+    set_gimbal(
+        PAN_INITIAL_ANGLE_DEG,
+        TILT_INITIAL_ANGLE_DEG
+    )
+
+
 def prepare_build_marker_camera():
     # Mineral detection no longer runs after route 0x01, so the camera can be
     # switched from RGB565 to grayscale for the white-frame detector without
@@ -611,10 +683,7 @@ def wait_for_initial_route():
         time.sleep_ms(10)
 
 
-set_gimbal(
-    PAN_INITIAL_ANGLE_DEG,
-    TILT_INITIAL_ANGLE_DEG
-)
+set_mineral_gimbal()
 
 
 if WAIT_MCU_82_BEFORE_CAMERA:
@@ -633,14 +702,16 @@ sensor.skip_frames(time=3000)
 sensor.set_auto_gain(False)
 sensor.set_auto_whitebal(False)
 
-set_pan(PAN_FORWARD_ANGLE_DEG)
+set_mineral_gimbal()
 
 clock = time.clock()
-target_filter = StableTarget()
+target_filter = TargetFilter()
 build_qr_reference = load_build_qr_reference()
 
 state = STATE_MINERAL_STABILIZE
 state_started_ms = pyb.millis()
+last_target_seen_ms = state_started_ms
+alignment_confirm_count = 0
 rx_state = 0
 
 if PURPLE_ONLY_TEST:
@@ -655,6 +726,8 @@ settle_next_state = STATE_MINERAL_STABILIZE
 settle_duration_ms = MOVE_SETTLE_MS
 
 frame_count = 0
+vision_sequence = 0
+last_vision_tx_ms = 0
 
 
 def color_name(color):
@@ -666,10 +739,39 @@ def color_name(color):
 def set_state(new_state):
     global state
     global state_started_ms
+    global last_target_seen_ms
+    global alignment_confirm_count
 
+    now_ms = pyb.millis()
     state = new_state
-    state_started_ms = pyb.millis()
+    state_started_ms = now_ms
+    last_target_seen_ms = now_ms
+    alignment_confirm_count = 0
     target_filter.clear()
+
+
+def mark_target_seen():
+    global last_target_seen_ms
+
+    last_target_seen_ms = pyb.millis()
+
+
+def reset_alignment_confirmation():
+    global alignment_confirm_count
+
+    alignment_confirm_count = 0
+
+
+def alignment_is_confirmed(currently_aligned):
+    global alignment_confirm_count
+
+    if currently_aligned:
+        if alignment_confirm_count < ALIGNMENT_CONFIRM_FRAMES:
+            alignment_confirm_count += 1
+    else:
+        alignment_confirm_count = 0
+
+    return alignment_confirm_count >= ALIGNMENT_CONFIRM_FRAMES
 
 
 def begin_settle(next_state, duration_ms):
@@ -701,8 +803,82 @@ def send_uart_frame(frame):
     return True
 
 
+def send_vision_target(
+    valid,
+    forward_error_cm=0.0,
+    right_error_cm=0.0,
+    force=False
+):
+    global vision_sequence
+    global last_vision_tx_ms
+
+    now_ms = pyb.millis()
+
+    if (
+        not force
+        and pyb.elapsed_millis(last_vision_tx_ms)
+        < VISION_TX_INTERVAL_MS
+    ):
+        return True
+
+    last_vision_tx_ms = now_ms
+    vision_sequence = (vision_sequence + 1) & 0xFF
+
+    if valid:
+        flags = VISION_FLAG_VALID
+        forward_error_mm = clamp(
+            round_int(forward_error_cm * 10.0),
+            -32768,
+            32767
+        )
+        right_error_mm = clamp(
+            round_int(right_error_cm * 10.0),
+            -32768,
+            32767
+        )
+    else:
+        flags = 0
+        forward_error_mm = 0
+        right_error_mm = 0
+
+    forward_raw = forward_error_mm & 0xFFFF
+    right_raw = right_error_mm & 0xFFFF
+
+    frame = bytearray(
+        (
+            0x66,
+            0x66,
+            CMD_VISION_TARGET,
+            vision_sequence,
+            flags,
+            (forward_raw >> 8) & 0xFF,
+            forward_raw & 0xFF,
+            (right_raw >> 8) & 0xFF,
+            right_raw & 0xFF,
+        )
+    )
+
+    written = uart.write(frame)
+
+    if written is not None and written != len(frame):
+        print(
+            "VISION_UART_WRITE_FAILED: %s/%d"
+            % (str(written), len(frame))
+        )
+        set_state(STATE_FAULT)
+        return False
+
+    return True
+
+
+def stop_vision_control():
+    send_vision_target(False, force=True)
+
+
 def send_move(direction_deg, distance_cm, next_action):
     global after_move_action
+
+    stop_vision_control()
 
     frame, encoded_angle, encoded_distance = build_move_frame(
         direction_deg,
@@ -724,6 +900,8 @@ def send_move(direction_deg, distance_cm, next_action):
 def send_rotate_clockwise(clockwise_deg, next_action):
     global after_move_action
 
+    stop_vision_control()
+
     frame, encoded_clockwise = build_rotate_frame(
         clockwise_deg
     )
@@ -741,6 +919,7 @@ def send_rotate_clockwise(clockwise_deg, next_action):
 
 
 def send_grab_command():
+    stop_vision_control()
     set_state(STATE_WAIT_GRAB_83)
     send_uart_frame(
         bytearray((0x66, 0x66, CMD_ARM_GRAB))
@@ -748,6 +927,7 @@ def send_grab_command():
 
 
 def send_route_01_command():
+    stop_vision_control()
     set_state(STATE_WAIT_ROUTE_01_84)
     send_uart_frame(
         bytearray(
@@ -757,6 +937,7 @@ def send_route_01_command():
 
 
 def send_build_command():
+    stop_vision_control()
     set_state(STATE_WAIT_BUILD_85)
     send_uart_frame(
         bytearray((0x66, 0x66, CMD_ARM_BUILD))
@@ -768,18 +949,21 @@ def dispatch_after_move():
 
     if after_move_action == AFTER_MOVE_RECHECK_ORANGE:
         current_color = COLOR_ORANGE
+        set_mineral_gimbal()
         begin_settle(
             STATE_MINERAL_STABILIZE,
             MOVE_SETTLE_MS
         )
     elif after_move_action == AFTER_MOVE_RECHECK_PURPLE:
         current_color = COLOR_PURPLE
+        set_mineral_gimbal()
         begin_settle(
             STATE_MINERAL_STABILIZE,
             MOVE_SETTLE_MS
         )
     elif after_move_action == AFTER_MOVE_START_PURPLE:
         current_color = COLOR_PURPLE
+        set_mineral_gimbal()
         begin_settle(
             STATE_MINERAL_STABILIZE,
             GIMBAL_SETTLE_MS
@@ -809,17 +993,13 @@ def dispatch_after_move():
         )
     elif after_move_action == AFTER_MOVE_PURPLE_FINAL_BACKWARD_DONE:
         send_rotate_clockwise(
-            PURPLE_FINAL_CLOCKWISE_DEG,
+            PURPLE_FINAL_ROTATION_DEG,
             AFTER_MOVE_PURPLE_FINAL_TURN_DONE
         )
     elif after_move_action == AFTER_MOVE_PURPLE_FINAL_TURN_DONE:
-        set_gimbal(
-            PAN_BUILD_QR_ANGLE_DEG,
-            TILT_BUILD_QR_ANGLE_DEG
-        )
         begin_settle(
             STATE_SEND_ROUTE_01,
-            GIMBAL_SETTLE_MS
+            MOVE_SETTLE_MS
         )
     elif after_move_action == AFTER_MOVE_RECHECK_BUILD_QR:
         begin_settle(
@@ -898,6 +1078,10 @@ def handle_mcu_message(message_type):
     elif message_type == MCU_BUILD_AREA_ARRIVED:
         if state == STATE_WAIT_ROUTE_01_84:
             print("BUILD_AREA_ARRIVED: 66 66 84")
+            set_gimbal(
+                PAN_BUILD_QR_ANGLE_DEG,
+                TILT_BUILD_QR_ANGLE_DEG
+            )
             prepare_build_marker_camera()
             begin_settle(
                 STATE_BUILD_QR,
@@ -950,11 +1134,11 @@ def search_if_timed_out(
     if state != STATE_MINERAL_STABILIZE:
         return False
 
-    if pyb.elapsed_millis(state_started_ms) < NO_TARGET_TIMEOUT_MS:
+    if pyb.elapsed_millis(last_target_seen_ms) < NO_TARGET_TIMEOUT_MS:
         return False
 
     print(
-        "%s_NO_3_STABLE_FRAMES_%dMS: search %s %d cm"
+        "%s_NO_TARGET_%dMS: search %s %d cm"
         % (
             color_name(current_color),
             NO_TARGET_TIMEOUT_MS,
@@ -982,10 +1166,17 @@ def process_mineral_target(
     should_print
 ):
     if selected is None:
-        target_filter.clear()
+        reset_alignment_confirmation()
+        missing_ms = pyb.elapsed_millis(last_target_seen_ms)
+
+        # Do not turn a one-frame threshold flicker into a stop/start pulse.
+        # The STM32 keeps the latest target briefly; a sustained loss stops it.
+        if missing_ms >= VISION_TARGET_LOST_STOP_MS:
+            target_filter.clear()
+            send_vision_target(False)
 
         if should_print:
-            print("%s_NO_TARGET" % label)
+            print("%s_NO_TARGET: %dms" % (label, missing_ms))
 
         search_if_timed_out(
             search_direction_deg,
@@ -994,38 +1185,42 @@ def process_mineral_target(
         )
         return
 
-    if not blob_is_complete(selected):
+    # Seeing a color blob is enough to prevent the discrete 10 cm search.
+    # Position changes while the chassis is moving are expected and must not
+    # be mistaken for an unstable/missing target.
+    mark_target_seen()
+
+    if not mineral_height_is_complete(selected):
+        reset_alignment_confirmation()
         target_filter.clear()
+        send_vision_target(False)
 
         if should_print:
-            print("%s_TARGET_INCOMPLETE" % label)
+            print("%s_TARGET_HEIGHT_INCOMPLETE" % label)
 
-        search_if_timed_out(
-            search_direction_deg,
-            search_next_action,
-            search_direction_name
-        )
         return
 
-    target_filter.add(label, selected)
-    stable = target_filter.result()
+    measurement = rightmost_block_measurement(selected)
+    measured_cx = measurement[0]
+    measured_cy = measurement[1]
+    measured_side_px = measurement[2]
+    measured_height_px = measurement[3]
+    right_edge_visible = measurement[4]
+
+    target_filter.add_values(
+        label,
+        measured_cx,
+        measured_cy,
+        measured_side_px,
+        measured_height_px
+    )
+    stable = target_filter.filtered_result(
+        TRACKING_FILTER_MIN_SAMPLES
+    )
 
     if stable is None:
-        if should_print:
-            print(
-                "%s_STABILIZING: %d/%d"
-                % (
-                    label,
-                    len(target_filter.samples),
-                    FILTER_WINDOW,
-                )
-            )
-
-        search_if_timed_out(
-            search_direction_deg,
-            search_next_action,
-            search_direction_name
-        )
+        reset_alignment_confirmation()
+        send_vision_target(False)
         return
 
     cx = stable[1]
@@ -1036,7 +1231,9 @@ def process_mineral_target(
     pose = estimate_target_pose(cx, width)
 
     if pose is None:
+        reset_alignment_confirmation()
         target_filter.clear()
+        send_vision_target(False)
         return
 
     camera_forward_cm = pose[0]
@@ -1046,14 +1243,12 @@ def process_mineral_target(
         camera_forward_cm < MIN_VALID_FORWARD_CM
         or camera_forward_cm > MAX_VALID_FORWARD_CM
     ):
+        reset_alignment_confirmation()
+        send_vision_target(False)
+
         if should_print:
             print("%s_OUTSIDE_DISTANCE_CALIBRATION" % label)
 
-        search_if_timed_out(
-            search_direction_deg,
-            search_next_action,
-            search_direction_name
-        )
         return
 
     move = calculate_chassis_move(
@@ -1068,9 +1263,17 @@ def process_mineral_target(
     move_direction_deg = move[4]
     move_distance_cm = move[5]
 
+    send_vision_target(
+        True,
+        move_camera_forward_cm,
+        move_camera_right_cm
+    )
+
     if should_print:
         print(
-            "%s,cx=%d,cy=%d,w=%d,h=%d,Z=%.2fcm,X=%.2fcm,"
+            "%s,rightmost_cx=%d,cy=%d,side=%d,h=%d,"
+            "group_x=%d,group_w=%d,right_visible=%d,"
+            "Z=%.2fcm,X=%.2fcm,"
             "target_Z=%.2fcm,target_X=%.2fcm,"
             "camera_df=%.2fcm,camera_dr=%.2fcm,"
             "chassis_dir=%.1fdeg,chassis_dist=%.2fcm"
@@ -1080,6 +1283,9 @@ def process_mineral_target(
                 cy,
                 width,
                 height,
+                selected.x(),
+                selected.w(),
+                1 if right_edge_visible else 0,
                 camera_forward_cm,
                 camera_right_cm,
                 target_forward_cm,
@@ -1091,19 +1297,26 @@ def process_mineral_target(
             )
         )
 
-    if (
+    currently_aligned = (
         abs(move_camera_forward_cm) <= FORWARD_TOLERANCE_CM
         and abs(move_camera_right_cm) <= RIGHT_TOLERANCE_CM
-    ):
+        and right_edge_visible
+    )
+
+    if alignment_is_confirmed(currently_aligned):
         print("%s_TARGET_ALIGNED: send grab" % label)
         send_grab_command()
         return
 
-    send_move(
-        move_direction_deg,
-        move_distance_cm,
-        search_next_action
-    )
+    if should_print and currently_aligned:
+        print(
+            "%s_ALIGNMENT_CONFIRMING: %d/%d"
+            % (
+                label,
+                alignment_confirm_count,
+                ALIGNMENT_CONFIRM_FRAMES,
+            )
+        )
 
 
 def decide_orange_mining(orange_blob, should_print):
@@ -1140,6 +1353,9 @@ def decide_purple_mining(purple_blob, should_print):
 
 def process_build_marker(img, should_print):
     if build_qr_reference is None:
+        reset_alignment_confirmation()
+        send_vision_target(False)
+
         if should_print:
             print(
                 "BUILD_MARKER_DISABLED: missing %s"
@@ -1150,11 +1366,20 @@ def process_build_marker(img, should_print):
     marker = find_largest_build_marker(img)
 
     if marker is None:
-        target_filter.clear()
+        reset_alignment_confirmation()
+
+        if (
+            pyb.elapsed_millis(last_target_seen_ms)
+            >= VISION_TARGET_LOST_STOP_MS
+        ):
+            target_filter.clear()
+            send_vision_target(False)
 
         if should_print:
             print("BUILD_MARKER_NOT_FOUND")
         return
+
+    mark_target_seen()
 
     img.draw_rectangle(
         marker.rect(),
@@ -1168,21 +1393,22 @@ def process_build_marker(img, should_print):
     )
 
     if not blob_is_complete(marker):
+        reset_alignment_confirmation()
         target_filter.clear()
+        send_vision_target(False)
 
         if should_print:
             print("BUILD_MARKER_INCOMPLETE")
         return
 
     target_filter.add("BUILD_MARKER", marker)
-    stable = target_filter.result()
+    stable = target_filter.filtered_result(
+        TRACKING_FILTER_MIN_SAMPLES
+    )
 
     if stable is None:
-        if should_print:
-            print(
-                "BUILD_MARKER_STABILIZING: %d/%d"
-                % (len(target_filter.samples), FILTER_WINDOW)
-            )
+        reset_alignment_confirmation()
+        send_vision_target(False)
         return
 
     cx = stable[1]
@@ -1191,7 +1417,9 @@ def process_build_marker(img, should_print):
     height = stable[4]
 
     if width < BUILD_QR_MIN_WIDTH_PX:
+        reset_alignment_confirmation()
         target_filter.clear()
+        send_vision_target(False)
 
         if should_print:
             print("BUILD_MARKER_TOO_SMALL")
@@ -1239,7 +1467,16 @@ def process_build_marker(img, should_print):
         move_direction_deg -= 360.0
 
     if move_distance_cm > BUILD_QR_MAX_CORRECTION_CM:
+        scale = BUILD_QR_MAX_CORRECTION_CM / move_distance_cm
+        move_camera_forward_cm *= scale
+        move_camera_right_cm *= scale
         move_distance_cm = BUILD_QR_MAX_CORRECTION_CM
+
+    send_vision_target(
+        True,
+        move_camera_forward_cm,
+        move_camera_right_cm
+    )
 
     if should_print:
         print(
@@ -1264,21 +1501,26 @@ def process_build_marker(img, should_print):
             )
         )
 
-    if (
+    currently_aligned = (
         abs(move_camera_forward_cm)
         <= BUILD_QR_FORWARD_TOLERANCE_CM
         and abs(move_camera_right_cm)
         <= BUILD_QR_RIGHT_TOLERANCE_CM
-    ):
+    )
+
+    if alignment_is_confirmed(currently_aligned):
         print("BUILD_MARKER_ALIGNED: send build command")
         send_build_command()
         return
 
-    send_move(
-        move_direction_deg,
-        move_distance_cm,
-        AFTER_MOVE_RECHECK_BUILD_QR
-    )
+    if should_print and currently_aligned:
+        print(
+            "BUILD_MARKER_ALIGNMENT_CONFIRMING: %d/%d"
+            % (
+                alignment_confirm_count,
+                ALIGNMENT_CONFIRM_FRAMES,
+            )
+        )
 
 
 if PURPLE_ONLY_TEST:
@@ -1328,7 +1570,7 @@ while True:
 
     if state == STATE_MINERAL_STABILIZE:
         if current_color == COLOR_ORANGE:
-            orange = find_largest(
+            orange = find_rightmost_mineral(
                 img.find_blobs(
                     [ORANGE_THRESHOLD],
                     pixels_threshold=200,
@@ -1344,8 +1586,8 @@ while True:
                     thickness=2
                 )
                 img.draw_cross(
-                    orange.cx(),
-                    orange.cy(),
+                    rightmost_block_measurement(orange)[0],
+                    rightmost_block_measurement(orange)[1],
                     color=(255, 128, 0)
                 )
 
@@ -1354,7 +1596,7 @@ while True:
                 should_print
             )
         else:
-            purple = find_largest(
+            purple = find_rightmost_mineral(
                 img.find_blobs(
                     [PURPLE_THRESHOLD],
                     pixels_threshold=200,
@@ -1370,8 +1612,8 @@ while True:
                     thickness=2
                 )
                 img.draw_cross(
-                    purple.cx(),
-                    purple.cy(),
+                    rightmost_block_measurement(purple)[0],
+                    rightmost_block_measurement(purple)[1],
                     color=(255, 0, 255)
                 )
 
